@@ -1,0 +1,26 @@
+- hosts: kube_server
+  become: true
+  remote_user: debian
+
+  tasks:
+  - name: create /etc/haproxy
+    file:
+      path: /etc/haproxy
+      state: directory
+      mode: '0755'
+
+  - name: create haproxy.cfg
+    template:
+      src: haproxy.cfg.j2
+      dest: /etc/haproxy/haproxy.cfg
+
+  - name: create /etc/kubernetes/manifests
+    file:
+      path: /etc/kubernetes/manifests
+      state: directory
+      mode: '0755'
+
+  - name: create haproxy manifest
+    template:
+      src: templates/haproxy_manifest.yml.j2
+      dest: /etc/kubernetes/manifests/haproxy.yaml

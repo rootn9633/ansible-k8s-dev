@@ -1,0 +1,28 @@
+- hosts: kube_server[0]
+  become: false
+  remote_user: debian
+
+  tasks:
+  - name: Extract the join command
+    become: true
+    command: "kubeadm token create --print-join-command"
+    register: join_command
+
+  - name: show join command
+    debug:
+      var: join_command
+
+  - name: Generate new certs
+    become: true
+    command: "kubeadm init phase upload-certs --upload-certs"
+    register: cert
+
+  - name: show cert command
+    debug:
+      var: cert
+
+  - name: Save kubeadm cert for master
+    local_action: copy content={{ cert.stdout_lines | last | trim }} dest={{ join_command_master_location }} # defaults to your local cwd/join_command.out
+
+  - name: Save kubeadm join command for cluster
+    local_action: copy content={{ join_command.stdout_lines | last | trim }} dest={{ join_command_worker_location }} # defaults to your local cwd/join_command.out

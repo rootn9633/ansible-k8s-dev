@@ -1,0 +1,16 @@
+- name: Install k8s dependencies
+  import_playbook: roles/kubernetes/install_kubernetes_dependencies.yml
+- name: Install keepalived
+  import_playbook: roles/kubernetes/install_keepalived.yml
+- name: Install haproxy
+  import_playbook: roles/kubernetes/install_haproxy.yml
+- name: Init cluster
+  import_playbook: roles/kubernetes/init_cluster.yml
+- name: Get join command
+  import_playbook: roles/kubernetes/get_join_command.yml
+- name: Join masters
+  import_playbook: roles/kubernetes/join_masters.yml
+- name: Join workers
+  import_playbook: roles/kubernetes/join_workers.yml
+- name: Install NFS
+  import_playbook: roles/kubernetes/install_nfs.yml

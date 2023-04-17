@@ -1,0 +1,10 @@
+- hosts: all
+  become: true
+  remote_user: debian
+
+  tasks:
+  - name: Install nfs-common
+    ansible.builtin.apt:
+      name: nfs-common
+      update_cache: yes
+

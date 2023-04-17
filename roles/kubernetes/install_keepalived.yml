@@ -1,0 +1,37 @@
+- hosts: kube_server
+  become: true
+  remote_user: debian
+
+  tasks:
+  - name: set master or slave
+    set_fact:
+      keepalived_role: "{{'master' if groups['kube_server'].index(inventory_hostname) == 0 else 'backup'  }}"
+  - name: show role
+    debug:
+      var: keepalived_role
+  - name: create /etc/keepalived
+    file:
+      path: /etc/keepalived
+      state: directory
+      mode: '0755'
+  - name: create keepalived.conf
+    template:
+      src: keepalived.conf.j2
+      dest: /etc/keepalived/keepalived.conf
+
+  - name: create check_apiserver.sh
+    template:
+      src: templates/check_apiserver.sh.j2
+      dest: /etc/keepalived/check_apiserver.sh
+      mode: '0755'
+
+  - name: create /etc/kubernetes/manifests
+    file:
+      path: /etc/kubernetes/manifests
+      state: directory
+      mode: '0755'
+
+  - name: create keepalived manifest
+    template:
+      src: templates/keepalived_manifest.yml.j2
+      dest: /etc/kubernetes/manifests/keepalived.yaml

@@ -1,0 +1,13 @@
+# this is a basic file putting different hosts into categories
+# used by ansible to determine which actions to run on which hosts
+all:
+  children:
+    kube_server:
+      hosts:
+        192.168.4.41:
+        192.168.4.42:
+        192.168.4.43:
+    kube_agents:
+      hosts:
+        192.168.4.51:
+        192.168.4.52:
