@@ -19,7 +19,7 @@ vrrp_instance VI_1 {
         auth_pass {{ keepalived[keepalived_role].auth_pass }}
     }
     virtual_ipaddress {
-        {{ keepalived[keepalived_role].apiserver_vip }}
+        {{ control_vip }}
     }
     track_script {
         check_apiserver

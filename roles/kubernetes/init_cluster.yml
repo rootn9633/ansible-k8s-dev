@@ -16,7 +16,7 @@
       state: restarted
 
   - name: Initialize Kubernetes cluster
-    command: "kubeadm init --pod-network-cidr {{ pod_cidr }} --control-plane-endpoint \"192.168.4.31:4200\" --upload-certs"
+    command: "kubeadm init --pod-network-cidr {{ pod_cidr }} --control-plane-endpoint \"{{ control_vip }}:{{ control_port  }}\" --upload-certs"
     args:
       creates: /etc/kubernetes/admin.conf # skip this task if the file already exists
     register: kube_init
