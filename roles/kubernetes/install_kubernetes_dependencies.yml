@@ -107,6 +107,33 @@
   - name: Ensure containerd is restarted immediately if necessary.
     meta: flush_handlers
 
+  - name: Load required kernel modules
+    community.general.modprobe:
+      name: "{{ item }}"
+      state: present
+    loop:
+      - overlay
+      - br_netfilter
+
+  - name: Persist kernel modules across reboots
+    copy:
+      dest: /etc/modules-load.d/k8s.conf
+      content: |
+        overlay
+        br_netfilter
+
+  - name: Set required sysctl params
+    ansible.posix.sysctl:
+      name: "{{ item.key }}"
+      value: "{{ item.value }}"
+      sysctl_set: true
+      state: present
+      reload: true
+    loop:
+      - { key: net.bridge.bridge-nf-call-iptables, value: "1" }
+      - { key: net.bridge.bridge-nf-call-ip6tables, value: "1" }
+      - { key: net.ipv4.ip_forward, value: "1" }
+
   - name: Remove swapfile from /etc/fstab
     mount:
       name: "{{ item }}"
