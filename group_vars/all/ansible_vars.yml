@@ -3,7 +3,8 @@
 # apparently it isn't too hard to run out of IPs in a /24, so we're using a /22
 pod_cidr: "10.16.0.0/22"
 control_vip: "192.168.3.30"
-control_port: "4200"
+apiserver_port: 6443          # real kube-apiserver port
+haproxy_port: 4200            # HAProxy frontend port (control plane endpoint)
 
 # this defines what the join command filename will be
 join_command_master_location: "join_command_master.out"
@@ -11,4 +12,3 @@ join_command_worker_location: "join_command_worker.out"
 
 # setting the home directory for retreiving, saving, and executing files
 home_dir: "/home/debian"
-
