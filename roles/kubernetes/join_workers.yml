@@ -25,3 +25,5 @@
 
   - name: join agents to cluster
     command: "{{ join_command_local.msg }}"
+    args:
+      creates: /etc/kubernetes/kubelet.conf

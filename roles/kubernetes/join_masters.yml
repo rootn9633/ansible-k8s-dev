@@ -29,3 +29,5 @@
 
   - name: join agents to cluster
     command: "{{ join_command_local.msg }} --control-plane --certificate-key {{ cert_local.msg }}"
+    args:
+      creates: /etc/kubernetes/kubelet.conf
