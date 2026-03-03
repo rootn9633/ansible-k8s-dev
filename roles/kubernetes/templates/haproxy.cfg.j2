@@ -12,20 +12,14 @@ global
 # use if not designated in their block
 #---------------------------------------------------------------------
 defaults
-    mode                    http
+    mode                    tcp
     log                     global
-    option                  httplog
+    option                  tcplog
     option                  dontlognull
-    option http-server-close
-    option forwardfor       except 127.0.0.0/8
-    option                  redispatch
     retries                 1
-    timeout http-request    10s
-    timeout queue           20s
     timeout connect         5s
     timeout client          20s
     timeout server          20s
-    timeout http-keep-alive 10s
     timeout check           10s
 
 #---------------------------------------------------------------------
@@ -44,7 +38,6 @@ backend apiserver
     option httpchk GET /healthz
     http-check expect status 200
     mode tcp
-    option ssl-hello-chk
     balance     roundrobin
         {% for host in play_hosts %}
         server host{{ loop.index }} {{ host }}:{{ apiserver_port }} check
