@@ -1,0 +1,10 @@
+- hosts: all
+  become: true
+  remote_user: debian
+
+  tasks:
+  - name: Install open-iscsi
+    ansible.builtin.apt:
+      name: open-iscsi
+      update_cache: yes
+

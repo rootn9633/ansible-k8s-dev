@@ -14,3 +14,5 @@
   import_playbook: roles/kubernetes/join_workers.yml
 - name: Install NFS
   import_playbook: roles/kubernetes/install_nfs.yml
+- name: Install iscsi
+  import_playbook: roles/kubernetes/install_iscsi.yml

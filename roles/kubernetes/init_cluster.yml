@@ -3,18 +3,6 @@
   remote_user: debian
 
   tasks:
-  - name: set docker to use systemd cgroups driver
-    copy:
-      dest: "/etc/docker/daemon.json"
-      content: |
-        {
-          "exec-opts": ["native.cgroupdriver=systemd"]
-        }
-  - name: restart docker
-    service:
-      name: docker
-      state: restarted
-
   - name: Initialize Kubernetes cluster
     command: "kubeadm init --pod-network-cidr {{ pod_cidr }} --control-plane-endpoint \"{{ control_vip }}:{{ control_port  }}\" --upload-certs"
     args:

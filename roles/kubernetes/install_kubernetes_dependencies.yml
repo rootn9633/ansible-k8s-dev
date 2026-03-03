@@ -22,6 +22,11 @@
       - gnupg-agent
       - software-properties-common
 
+  - name: create keyrings directory
+    file:
+      path: /etc/apt/keyrings
+      state: directory
+
   - name: Add an apt signing key for Docker
     apt_key:
       url: https://download.docker.com/linux/debian/gpg
@@ -49,6 +54,59 @@
       state: started
       enabled: yes
 
+  - name: Ensure containerd is started and enabled at boot.
+    service:
+      name: containerd
+      state: started
+      enabled: yes
+
+  - name: create Containerd directory
+    file:
+      path: /etc/containerd
+      state: directory
+
+  - name: Get defaults from containerd.
+    command: containerd config default
+    changed_when: false
+    register: containerd_config_default
+
+  - name: Prepare containerd/config.toml from default config
+    copy:
+      dest: /tmp/containerd_config.toml
+      content: "{{ containerd_config_default.stdout }}"
+    changed_when: false
+
+  - name: Set Cgroup driver to systemd
+    lineinfile:
+      insertafter: '.*\[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options\]$'
+      line: '          SystemdCgroup = true'
+      state: present
+      path: /tmp/containerd_config.toml
+    changed_when: false
+
+  - name: Make sure  SystemdCgroup = false is not set
+    ansible.builtin.lineinfile:
+      path: /tmp/containerd_config.toml
+      state: absent
+      line: '            SystemdCgroup = false'
+    notify: restart containerd
+    changed_when: false
+
+  - name: Copy config.toml to /etc/containerd
+    copy:
+      remote_src: true
+      src: /tmp/containerd_config.toml
+      dest: /etc/containerd/config.toml
+
+  - name: Cleanup temporary file
+    file:
+      path: /tmp/containerd_config.toml
+      state: absent
+    changed_when: false
+
+  - name: Ensure containerd is restarted immediately if necessary.
+    meta: flush_handlers
+
   - name: Remove swapfile from /etc/fstab
     mount:
       name: "{{ item }}"
@@ -63,15 +121,18 @@
     when: ansible_swaptotal_mb >= 0
 
   - name: Add an apt signing key for Kubernetes
-    apt_key:
-      url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
-      state: present
+    get_url:
+      url: https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key
+      dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+      mode: '0644'
+      force: true
+
 
   - name: Adding apt repository for Kubernetes
     apt_repository:
-      repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+      repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /"
       state: present
-      filename: kubernetes.list
+      filename: kubernetes
 
   - name: Install Kubernetes binaries
     apt:
@@ -81,9 +142,9 @@
     vars:
       packages:
         # it is usually recommended to specify which version you want to install
-        - kubelet=1.23.6-00
-        - kubeadm=1.23.6-00
-        - kubectl=1.23.6-00
+        - kubelet
+        - kubeadm
+        - kubectl
 
   - name: hold kubernetes binary versions (prevent from being updated)
     dpkg_selections:
@@ -100,6 +161,12 @@
 #    lineinfile:
 #      path: /etc/default/kubelet
 #      line: KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}
+
+  - name: Ensure kubelet is started and enabled at boot.
+    service:
+      name: kubelet
+      state: started
+      enabled: yes
 
   - name: Restart kubelet
     service:
