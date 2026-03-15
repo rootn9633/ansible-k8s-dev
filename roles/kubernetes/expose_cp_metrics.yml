@@ -1,0 +1,88 @@
+- hosts: kube_server
+  become: true
+  remote_user: debian
+  serial: 1
+
+  vars:
+    manifests:
+      - /etc/kubernetes/manifests/kube-controller-manager.yaml
+      - /etc/kubernetes/manifests/kube-scheduler.yaml
+
+  tasks:
+    - name: Update bind-address to 0.0.0.0
+      replace:
+        path: "{{ item }}"
+        regexp: '--bind-address=127\.0\.0\.1'
+        replace: '--bind-address=0.0.0.0'
+      loop: "{{ manifests }}"
+      register: bind_result
+
+    - name: Update etcd listen-metrics-urls to 0.0.0.0
+      replace:
+        path: /etc/kubernetes/manifests/etcd.yaml
+        regexp: '--listen-metrics-urls=http://127\.0\.0\.1:2381'
+        replace: '--listen-metrics-urls=http://0.0.0.0:2381'
+      register: etcd_result
+
+    - name: Wait for API server to recover after etcd restart
+      when: etcd_result.changed
+      command: kubectl get --raw /readyz
+      environment:
+        KUBECONFIG: "{{ home_dir }}/.kube/config"
+      delegate_to: "{{ groups['kube_server'][0] }}"
+      become: false
+      changed_when: false
+      register: api_ready
+      until: api_ready.rc == 0
+      retries: 30
+      delay: 10
+
+    - name: Wait for static pods to restart with new config
+      when: bind_result.changed or etcd_result.changed
+      command: >
+        kubectl wait --for=condition=Ready pod
+        -l tier=control-plane -n kube-system --timeout=120s
+      environment:
+        KUBECONFIG: "{{ home_dir }}/.kube/config"
+      delegate_to: "{{ groups['kube_server'][0] }}"
+      become: false
+      changed_when: false
+
+- hosts: kube_server[0]
+  become: false
+  remote_user: debian
+
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Check current kube-proxy metricsBindAddress
+      shell: |
+        kubectl get cm kube-proxy -n kube-system -o jsonpath='{.data.config\.conf}' \
+          | grep -oP 'metricsBindAddress:\s*\K.*'
+      changed_when: false
+      register: kp_metrics_bind
+
+    - name: Patch kube-proxy metricsBindAddress to 0.0.0.0
+      when: kp_metrics_bind.stdout != '"0.0.0.0:10249"'
+      shell: |
+        kubectl get cm kube-proxy -n kube-system -o json \
+          | python3 -c "
+        import sys, json
+        cm = json.load(sys.stdin)
+        conf = cm['data']['config.conf']
+        conf = conf.replace('metricsBindAddress: \"\"', 'metricsBindAddress: \"0.0.0.0:10249\"')
+        conf = conf.replace('metricsBindAddress: 127.0.0.1:10249', 'metricsBindAddress: \"0.0.0.0:10249\"')
+        cm['data']['config.conf'] = conf
+        json.dump(cm, sys.stdout)
+        " | kubectl apply -f -
+      register: kp_patch
+
+    - name: Rollout restart kube-proxy DaemonSet
+      when: kp_patch.changed
+      command: kubectl rollout restart daemonset kube-proxy -n kube-system
+
+    - name: Wait for kube-proxy rollout to complete
+      when: kp_patch.changed
+      command: kubectl rollout status daemonset kube-proxy -n kube-system --timeout=120s
+      changed_when: false
