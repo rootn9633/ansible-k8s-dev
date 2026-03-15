@@ -1,0 +1,723 @@
+---
+# Kubernetes kubeadm upgrade playbook — one minor version hop at a time.
+#
+# Usage:
+#   ansible-playbook -i dev_hosts.yml roles/kubernetes/upgrade_k8s.yml -e target_version=1.31.4-1.1
+
+########################################################################
+# Play 1 — Pre-flight checks
+########################################################################
+- name: Pre-flight checks
+  hosts: kube_server[0]
+  become: true
+  remote_user: debian
+  any_errors_fatal: true
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Validate target_version is provided
+      fail:
+        msg: "target_version is required (e.g. -e target_version=1.31.4-1.1)"
+      when: target_version is not defined
+
+    - name: Validate target_version format
+      fail:
+        msg: >-
+          target_version '{{ target_version }}' has invalid format.
+          Expected MAJOR.MINOR.PATCH-BUILD (e.g. 1.31.4-1.1).
+      when: target_version is not regex('^\\d+\\.\\d+\\.\\d+-\\d+\\.\\d+$')
+
+    - name: Derive target minor and kubeadm version
+      set_fact:
+        target_minor: "{{ target_version.split('-')[0].rsplit('.', 1)[0] }}"
+        target_kubeadm_ver: "v{{ target_version.split('-')[0] }}"
+
+    - name: Display upgrade target
+      debug:
+        msg: "Upgrading to K8s {{ target_kubeadm_ver }} (apt: {{ target_version }}, repo: v{{ target_minor }})"
+
+    - name: Get kubelet version from all nodes
+      command: kubectl get nodes -o jsonpath='{.items[*].status.nodeInfo.kubeletVersion}'
+      become: false
+      changed_when: false
+      register: all_node_versions
+
+    - name: Derive previous minor version
+      set_fact:
+        previous_minor: "{{ target_minor.split('.')[0] }}.{{ target_minor.split('.')[1] | int - 1 }}"
+
+    - name: Validate node versions are within upgrade range
+      vars:
+        versions: "{{ all_node_versions.stdout.split() }}"
+        minors: "{{ versions | map('regex_replace', '^v(\\d+\\.\\d+).*', '\\1') | unique | list }}"
+        allowed: ["{{ previous_minor }}", "{{ target_minor }}"]
+        invalid: "{{ minors | difference(allowed) }}"
+      fail:
+        msg: >-
+          Nodes have versions outside the expected range.
+          Allowed minors: {{ allowed | join(', ') }}, found: {{ versions | join(', ') }}.
+          Invalid minors: {{ invalid | join(', ') }}.
+      when: invalid | length > 0
+
+    - name: Detect partial upgrade (resuming previous run)
+      vars:
+        versions: "{{ all_node_versions.stdout.split() }}"
+        minors: "{{ versions | map('regex_replace', '^v(\\d+\\.\\d+).*', '\\1') | list }}"
+        already_upgraded: "{{ minors | select('equalto', target_minor) | list }}"
+      debug:
+        msg: >-
+          Resuming partial upgrade: {{ already_upgraded | length }}/{{ versions | length }}
+          nodes already at v{{ target_minor }}. Remaining nodes will be upgraded.
+      when: already_upgraded | length > 0 and already_upgraded | length < minors | length
+
+    - name: Fail if all nodes are already at target version
+      vars:
+        versions: "{{ all_node_versions.stdout.split() }}"
+        minors: "{{ versions | map('regex_replace', '^v(\\d+\\.\\d+).*', '\\1') | list }}"
+        still_need_upgrade: "{{ minors | reject('equalto', target_minor) | list }}"
+      fail:
+        msg: >-
+          All nodes are already at v{{ target_minor }}. Nothing to upgrade.
+      when: still_need_upgrade | length == 0
+
+    - name: Check for NotReady nodes
+      shell: kubectl get nodes --no-headers | grep -v ' Ready ' || true
+      become: false
+      changed_when: false
+      register: not_ready_nodes
+
+    - name: Fail if any nodes are not Ready
+      fail:
+        msg: >-
+          Some nodes are not Ready. Resolve before upgrading:
+          {{ not_ready_nodes.stdout }}
+      when: not_ready_nodes.stdout | trim != ""
+
+    - name: Check etcdctl is available
+      command: which etcdctl
+      changed_when: false
+      register: etcdctl_check
+      ignore_errors: true
+
+    - name: Fail if etcdctl is not installed
+      fail:
+        msg: >-
+          etcdctl not found. Install it or copy from the etcd container:
+          kubectl cp kube-system/<etcd-pod>:/usr/local/bin/etcdctl /usr/local/bin/etcdctl
+      when: etcdctl_check.rc != 0
+
+    - name: Create etcd backup directory
+      file:
+        path: /var/backups/etcd
+        state: directory
+        mode: '0700'
+
+    - name: Generate backup timestamp
+      set_fact:
+        etcd_backup_file: "etcd-backup-{{ target_version }}-{{ ansible_date_time.iso8601_basic_short }}.db"
+
+    - name: Backup etcd
+      command: >
+        etcdctl snapshot save /var/backups/etcd/{{ etcd_backup_file }}
+        --endpoints=https://127.0.0.1:2379
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt
+        --cert=/etc/kubernetes/pki/etcd/server.crt
+        --key=/etc/kubernetes/pki/etcd/server.key
+      environment:
+        KUBECONFIG: "{{ home_dir }}/.kube/config"
+        ETCDCTL_API: "3"
+
+    - name: Verify etcd backup integrity
+      command: >
+        etcdctl snapshot status /var/backups/etcd/{{ etcd_backup_file }}
+        --write-out=table
+      environment:
+        KUBECONFIG: "{{ home_dir }}/.kube/config"
+        ETCDCTL_API: "3"
+      changed_when: false
+      register: etcd_backup_status
+
+    - name: Display etcd backup status
+      debug:
+        var: etcd_backup_status.stdout_lines
+
+    - name: Check if Flux is installed
+      command: which flux
+      become: false
+      changed_when: false
+      register: flux_check
+      ignore_errors: true
+
+    - name: Suspend Flux kustomizations
+      command: flux suspend kustomization --all
+      become: false
+      when: flux_check.rc == 0
+
+    - name: Fetch API server metrics
+      command: kubectl get --raw /metrics
+      become: false
+      changed_when: false
+      register: api_metrics
+
+    - name: Check for deprecated API usage
+      set_fact:
+        deprecated_apis: "{{ api_metrics.stdout_lines | select('search', 'apiserver_requested_deprecated_apis') | list }}"
+
+    - name: Show deprecated API warnings
+      debug:
+        var: deprecated_apis
+      when: deprecated_apis | length > 0
+
+########################################################################
+# Play 2 — Upgrade control plane nodes (one at a time)
+########################################################################
+- name: Upgrade control plane nodes
+  hosts: kube_server
+  serial: 1
+  become: true
+  remote_user: debian
+  any_errors_fatal: true
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Upgrade control plane
+      block:
+        - name: Derive target versions
+          set_fact:
+            target_minor: "{{ target_version.split('-')[0].rsplit('.', 1)[0] }}"
+            target_kubeadm_ver: "v{{ target_version.split('-')[0] }}"
+
+        - name: Wait for API server to be ready
+          command: kubectl get --raw /readyz
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: api_precheck
+          until: api_precheck.rc == 0
+          retries: 30
+          delay: 10
+
+        - name: Resolve Kubernetes node name for this host
+          shell: >
+            kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name} {.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+            | awk '$2 == "{{ ansible_default_ipv4.address | default(inventory_hostname) }}" { print $1 }'
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: k8s_node_name_result
+
+        - name: Fail if Kubernetes node name could not be resolved
+          fail:
+            msg: >-
+              Could not resolve Kubernetes node name for {{ inventory_hostname }}.
+              Check: kubectl get nodes -o wide
+          when: k8s_node_name_result.stdout | trim == ""
+
+        - name: Set k8s_node_name fact
+          set_fact:
+            k8s_node_name: "{{ k8s_node_name_result.stdout | trim }}"
+
+        - name: Update Kubernetes apt signing key for target version
+          get_url:
+            url: "https://pkgs.k8s.io/core:/stable:/v{{ target_minor }}/deb/Release.key"
+            dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+            mode: '0644'
+            force: true
+
+        - name: Update Kubernetes apt repository to target version
+          apt_repository:
+            repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v{{ target_minor }}/deb/ /"
+            state: present
+            filename: kubernetes
+
+        - name: Unhold kubeadm
+          dpkg_selections:
+            name: kubeadm
+            selection: install
+
+        - name: Install target kubeadm version
+          apt:
+            name: "kubeadm={{ target_version }}"
+            state: present
+            update_cache: yes
+            force_apt_get: yes
+
+        - name: Hold kubeadm
+          dpkg_selections:
+            name: kubeadm
+            selection: hold
+
+        - name: Check current kubelet version on this node
+          command: "kubectl get node {{ k8s_node_name }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: node_current_version
+
+        - name: Set node upgrade needed flag
+          set_fact:
+            node_needs_upgrade: "{{ not (node_current_version.stdout.startswith('v' + target_version.split('-')[0])) }}"
+
+        - name: Verify upgrade plan (first control plane only)
+          command: "kubeadm upgrade plan {{ target_kubeadm_ver }}"
+          changed_when: false
+          register: upgrade_plan
+          when: inventory_hostname == groups['kube_server'][0] and node_needs_upgrade | bool
+
+        - name: Display upgrade plan
+          debug:
+            var: upgrade_plan.stdout_lines
+          when: upgrade_plan is not skipped
+
+        - name: Run kubeadm upgrade apply (first control plane only)
+          command: "kubeadm upgrade apply {{ target_kubeadm_ver }} -y"
+          timeout: 600
+          when: inventory_hostname == groups['kube_server'][0] and node_needs_upgrade | bool
+
+        - name: Run kubeadm upgrade node (other control planes)
+          command: kubeadm upgrade node
+          timeout: 600
+          when: inventory_hostname != groups['kube_server'][0] and node_needs_upgrade | bool
+
+        - name: Wait for API server to stabilize after upgrade
+          command: kubectl get --raw /readyz
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: api_ready
+          until: api_ready.rc == 0
+          retries: 30
+          delay: 10
+          when: node_needs_upgrade | bool
+
+        - name: Drain node
+          command: "kubectl drain {{ k8s_node_name }} --ignore-daemonsets --delete-emptydir-data --timeout=300s"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          register: drain_result
+          until: drain_result.rc == 0
+          retries: 3
+          delay: 30
+          when: node_needs_upgrade | bool
+
+        - name: Verify workloads evacuated from node
+          shell: >
+            kubectl get pods -A --field-selector spec.nodeName={{ k8s_node_name }}
+            --no-headers | grep -v -E '(kube-proxy|kube-flannel|calico-node|kindnet)' || true
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: remaining_pods
+          when: node_needs_upgrade | bool
+
+        - name: Warn if pods remain after drain
+          debug:
+            msg: "WARNING: Pods still on {{ k8s_node_name }} after drain: {{ remaining_pods.stdout_lines }}"
+          when: node_needs_upgrade | bool and remaining_pods.stdout | trim != ""
+
+        - name: Unhold kubelet and kubectl
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: install
+          loop:
+            - kubelet
+            - kubectl
+          when: node_needs_upgrade | bool
+
+        - name: Install target kubelet and kubectl versions
+          apt:
+            name: "{{ packages }}"
+            state: present
+            update_cache: yes
+            force_apt_get: yes
+          vars:
+            packages:
+              - "kubelet={{ target_version }}"
+              - "kubectl={{ target_version }}"
+          when: node_needs_upgrade | bool
+
+        - name: Hold kubelet and kubectl
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop:
+            - kubelet
+            - kubectl
+          when: node_needs_upgrade | bool
+
+        - name: Restart kubelet
+          service:
+            name: kubelet
+            daemon_reload: yes
+            state: restarted
+          when: node_needs_upgrade | bool
+
+        - name: Uncordon node
+          command: "kubectl uncordon {{ k8s_node_name }}"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          register: uncordon_result
+          until: uncordon_result.rc == 0
+          retries: 6
+          delay: 10
+          when: node_needs_upgrade | bool
+
+        - name: Wait for node to become Ready
+          command: "kubectl wait --for=condition=Ready node/{{ k8s_node_name }} --timeout=300s"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          when: node_needs_upgrade | bool
+
+      rescue:
+        - name: Pick a healthy CP for rescue commands
+          set_fact:
+            rescue_delegate: >-
+              {{ groups['kube_server'] | reject('equalto', inventory_hostname) | first
+                 | default(inventory_hostname) }}
+
+        - name: Re-hold packages after failure
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop:
+            - kubeadm
+            - kubelet
+            - kubectl
+          ignore_errors: true
+
+        - name: Attempt to uncordon node after failure
+          command: "kubectl uncordon {{ k8s_node_name | default(inventory_hostname) }}"
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          ignore_errors: true
+
+        - name: Check if Flux is installed (rescue)
+          command: which flux
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          changed_when: false
+          register: flux_check_rescue
+          ignore_errors: true
+
+        - name: Resume Flux kustomizations after failure
+          command: flux resume kustomization --all
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          changed_when: false
+          when: flux_check_rescue.rc == 0
+          ignore_errors: true
+
+        - name: Fail with upgrade error
+          fail:
+            msg: >-
+              Control plane upgrade failed on {{ inventory_hostname }}
+              (k8s node: {{ k8s_node_name | default('unknown') }}).
+              Best-effort uncordon, package re-hold, and Flux resume attempted (via {{ rescue_delegate }}).
+              Verify node state with: kubectl get nodes
+              Investigate and re-run.
+
+########################################################################
+# Play 3 — Upgrade worker nodes (one at a time)
+########################################################################
+- name: Upgrade worker nodes
+  hosts: kube_agents
+  serial: 1
+  become: true
+  remote_user: debian
+  any_errors_fatal: true
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Upgrade worker
+      block:
+        - name: Derive target versions
+          set_fact:
+            target_minor: "{{ target_version.split('-')[0].rsplit('.', 1)[0] }}"
+            target_kubeadm_ver: "v{{ target_version.split('-')[0] }}"
+
+        - name: Wait for API server to be ready
+          command: kubectl get --raw /readyz
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: api_precheck
+          until: api_precheck.rc == 0
+          retries: 30
+          delay: 10
+
+        - name: Resolve Kubernetes node name for this host
+          shell: >
+            kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name} {.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+            | awk '$2 == "{{ ansible_default_ipv4.address | default(inventory_hostname) }}" { print $1 }'
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: k8s_node_name_result
+
+        - name: Fail if Kubernetes node name could not be resolved
+          fail:
+            msg: >-
+              Could not resolve Kubernetes node name for {{ inventory_hostname }}.
+              Check: kubectl get nodes -o wide
+          when: k8s_node_name_result.stdout | trim == ""
+
+        - name: Set k8s_node_name fact
+          set_fact:
+            k8s_node_name: "{{ k8s_node_name_result.stdout | trim }}"
+
+        - name: Update Kubernetes apt signing key for target version
+          get_url:
+            url: "https://pkgs.k8s.io/core:/stable:/v{{ target_minor }}/deb/Release.key"
+            dest: /etc/apt/keyrings/kubernetes-apt-keyring.asc
+            mode: '0644'
+            force: true
+
+        - name: Update Kubernetes apt repository to target version
+          apt_repository:
+            repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v{{ target_minor }}/deb/ /"
+            state: present
+            filename: kubernetes
+
+        - name: Unhold kubeadm
+          dpkg_selections:
+            name: kubeadm
+            selection: install
+
+        - name: Install target kubeadm version
+          apt:
+            name: "kubeadm={{ target_version }}"
+            state: present
+            update_cache: yes
+            force_apt_get: yes
+
+        - name: Hold kubeadm
+          dpkg_selections:
+            name: kubeadm
+            selection: hold
+
+        - name: Check current kubelet version on this worker
+          command: "kubectl get node {{ k8s_node_name }} -o jsonpath='{.status.nodeInfo.kubeletVersion}'"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: node_current_version
+
+        - name: Set worker upgrade needed flag
+          set_fact:
+            node_needs_upgrade: "{{ not (node_current_version.stdout.startswith('v' + target_version.split('-')[0])) }}"
+
+        - name: Drain worker node
+          command: "kubectl drain {{ k8s_node_name }} --ignore-daemonsets --delete-emptydir-data --disable-eviction --timeout=300s"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          register: drain_result
+          until: drain_result.rc == 0
+          retries: 3
+          delay: 30
+          when: node_needs_upgrade | bool
+
+        - name: Verify workloads evacuated from worker
+          shell: >
+            kubectl get pods -A --field-selector spec.nodeName={{ k8s_node_name }}
+            --no-headers | grep -v -E '(kube-proxy|kube-flannel|calico-node|kindnet)' || true
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: remaining_pods
+          when: node_needs_upgrade | bool
+
+        - name: Warn if pods remain after drain
+          debug:
+            msg: "WARNING: Pods still on {{ k8s_node_name }} after drain: {{ remaining_pods.stdout_lines }}"
+          when: node_needs_upgrade | bool and remaining_pods.stdout | trim != ""
+
+        - name: Run kubeadm upgrade node
+          command: kubeadm upgrade node
+          timeout: 600
+          when: node_needs_upgrade | bool
+
+        - name: Unhold kubelet and kubectl
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: install
+          loop:
+            - kubelet
+            - kubectl
+          when: node_needs_upgrade | bool
+
+        - name: Install target kubelet and kubectl versions
+          apt:
+            name: "{{ packages }}"
+            state: present
+            update_cache: yes
+            force_apt_get: yes
+          vars:
+            packages:
+              - "kubelet={{ target_version }}"
+              - "kubectl={{ target_version }}"
+          when: node_needs_upgrade | bool
+
+        - name: Hold kubelet and kubectl
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop:
+            - kubelet
+            - kubectl
+          when: node_needs_upgrade | bool
+
+        - name: Restart kubelet
+          service:
+            name: kubelet
+            daemon_reload: yes
+            state: restarted
+          when: node_needs_upgrade | bool
+
+        - name: Uncordon worker node
+          command: "kubectl uncordon {{ k8s_node_name }}"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          register: uncordon_result
+          until: uncordon_result.rc == 0
+          retries: 6
+          delay: 10
+          when: node_needs_upgrade | bool
+
+        - name: Wait for worker node to become Ready
+          command: "kubectl wait --for=condition=Ready node/{{ k8s_node_name }} --timeout=300s"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          when: node_needs_upgrade | bool
+
+      rescue:
+        - name: Pick a healthy CP for rescue commands
+          set_fact:
+            rescue_delegate: "{{ groups['kube_server'][0] }}"
+
+        - name: Re-hold packages after failure
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop:
+            - kubeadm
+            - kubelet
+            - kubectl
+          ignore_errors: true
+
+        - name: Attempt to uncordon worker after failure
+          command: "kubectl uncordon {{ k8s_node_name | default(inventory_hostname) }}"
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          ignore_errors: true
+
+        - name: Check if Flux is installed (rescue)
+          command: which flux
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          changed_when: false
+          register: flux_check_rescue
+          ignore_errors: true
+
+        - name: Resume Flux kustomizations after failure
+          command: flux resume kustomization --all
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          changed_when: false
+          when: flux_check_rescue.rc == 0
+          ignore_errors: true
+
+        - name: Fail with upgrade error
+          fail:
+            msg: >-
+              Worker upgrade failed on {{ inventory_hostname }}
+              (k8s node: {{ k8s_node_name | default('unknown') }}).
+              Best-effort uncordon, package re-hold, and Flux resume attempted (via {{ rescue_delegate }}).
+              Verify node state with: kubectl get nodes
+              Investigate and re-run.
+
+########################################################################
+# Play 4 — Post-flight checks
+########################################################################
+- name: Post-flight checks
+  hosts: kube_server[0]
+  become: false
+  remote_user: debian
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Post-flight
+      block:
+        - name: Verify all nodes at new version
+          command: kubectl get nodes
+          changed_when: false
+          register: node_versions
+
+        - name: Display node versions
+          debug:
+            var: node_versions.stdout_lines
+
+        - name: Get kubelet versions from all nodes
+          command: >
+            kubectl get nodes -o jsonpath='{range .items[*]}{.status.nodeInfo.kubeletVersion}{"\n"}{end}'
+          changed_when: false
+          register: final_versions
+
+        - name: Fail if any node is not at target version
+          vars:
+            expected: "v{{ target_version.split('-')[0] }}"
+            bad_versions: "{{ final_versions.stdout_lines | select() | reject('equalto', expected) | list }}"
+          fail:
+            msg: >-
+              Not all nodes upgraded. Expected {{ expected }},
+              found: {{ final_versions.stdout_lines | join(', ') }}
+          when: bad_versions | length > 0
+
+        - name: Check if Flux is installed
+          command: which flux
+          changed_when: false
+          register: flux_check
+          ignore_errors: true
+
+        - name: Resume Flux kustomizations
+          command: flux resume kustomization --all
+          when: flux_check.rc == 0
+
+        - name: Check for unhealthy pods
+          shell: kubectl get pods -A --no-headers | grep -v Running | grep -v Completed || true
+          changed_when: false
+          register: unhealthy_pods
+
+        - name: Display unhealthy pods
+          debug:
+            var: unhealthy_pods.stdout_lines
+          when: unhealthy_pods.stdout | length > 0
+
+        - name: Upgrade complete
+          debug:
+            msg: "Kubernetes upgrade to {{ target_version }} completed successfully."
+
+      rescue:
+        - name: Check if Flux is installed (rescue)
+          command: which flux
+          changed_when: false
+          register: flux_check_rescue
+          ignore_errors: true
+
+        - name: Resume Flux kustomizations after post-flight failure
+          command: flux resume kustomization --all
+          changed_when: false
+          when: flux_check_rescue.rc == 0
+          ignore_errors: true
+
+        - name: Fail with post-flight error
+          fail:
+            msg: >-
+              Post-flight checks failed. The upgrade itself completed but
+              verification encountered an error. Flux resume attempted.
+              Run manually: kubectl get nodes && flux resume kustomization --all
