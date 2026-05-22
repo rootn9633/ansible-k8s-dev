@@ -226,11 +226,14 @@
             mode: '0644'
             force: true
 
-        - name: Update Kubernetes apt repository to target version
-          apt_repository:
-            repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v{{ target_minor }}/deb/ /"
-            state: present
-            filename: kubernetes
+        - name: Set Kubernetes apt repository to target version
+          # Write the file definitively rather than using apt_repository
+          # with state=present, which appends a new line per upgrade and
+          # leaves stale older-version repos behind.
+          copy:
+            dest: /etc/apt/sources.list.d/kubernetes.list
+            content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v{{ target_minor }}/deb/ /\n"
+            mode: '0644'
 
         - name: Unhold kubeadm
           dpkg_selections:
@@ -476,11 +479,14 @@
             mode: '0644'
             force: true
 
-        - name: Update Kubernetes apt repository to target version
-          apt_repository:
-            repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v{{ target_minor }}/deb/ /"
-            state: present
-            filename: kubernetes
+        - name: Set Kubernetes apt repository to target version
+          # Write the file definitively rather than using apt_repository
+          # with state=present, which appends a new line per upgrade and
+          # leaves stale older-version repos behind.
+          copy:
+            dest: /etc/apt/sources.list.d/kubernetes.list
+            content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.asc] https://pkgs.k8s.io/core:/stable:/v{{ target_minor }}/deb/ /\n"
+            mode: '0644'
 
         - name: Unhold kubeadm
           dpkg_selections:
