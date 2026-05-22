@@ -1,0 +1,549 @@
+---
+# Rolling OS upgrade playbook — upgrades all apt packages and reboots
+# each node one at a time, draining workloads first to avoid disruption.
+#
+# Usage:
+#   ansible-playbook -i dev_hosts.yml roles/kubernetes/upgrade_os.yml
+#
+# Optional variables:
+#   reboot_after_upgrade: true   — set to false to skip reboot
+#   upgrade_type: "full"         — "full" (dist-upgrade) or "safe" (upgrade)
+
+########################################################################
+# Play 1 — Ensure control-plane kubeconfig is current and HA
+########################################################################
+# kubeadm cert renewal (e.g. during a Kubernetes upgrade) regenerates
+# /etc/kubernetes/admin.conf but leaves the debian user's ~/.kube/config
+# stale, breaking every kubectl call below. Refresh it here so the run
+# is self-healing. Runs on all control-plane nodes (not just
+# kube_server[0]) so the rescue path — which delegates to a peer CP
+# node — also has a working kubeconfig. The server is pointed at the
+# keepalived VIP so kubectl survives any single CP node being down.
+- name: Ensure control-plane kubeconfig is current and HA
+  hosts: kube_server
+  become: true
+  remote_user: debian
+  any_errors_fatal: true
+
+  tasks:
+    - name: Ensure .kube directory exists
+      file:
+        path: "{{ home_dir }}/.kube"
+        state: directory
+        owner: debian
+        group: debian
+        mode: "0700"
+
+    - name: Read cluster admin.conf
+      slurp:
+        src: /etc/kubernetes/admin.conf
+      register: admin_conf
+
+    - name: Render kubeconfig pointed at the control-plane VIP
+      copy:
+        content: "{{ admin_conf.content | b64decode | regex_replace('server: https?://.*', 'server: https://' ~ control_vip ~ ':' ~ haproxy_port) }}"
+        dest: "{{ home_dir }}/.kube/config"
+        owner: debian
+        group: debian
+        mode: "0600"
+
+########################################################################
+# Play 2 — Pre-flight checks
+########################################################################
+- name: OS upgrade pre-flight checks
+  hosts: kube_server[0]
+  become: false
+  remote_user: debian
+  any_errors_fatal: true
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Verify all nodes are Ready
+      shell: kubectl get nodes --no-headers | grep -v ' Ready' || true
+      changed_when: false
+      register: not_ready_nodes
+
+    - name: Fail if any nodes are not Ready
+      fail:
+        msg: >-
+          Some nodes are not Ready. Resolve before upgrading OS:
+          {{ not_ready_nodes.stdout }}
+      when: not_ready_nodes.stdout | trim != ""
+
+    - name: Validate upgrade_type
+      fail:
+        msg: >-
+          upgrade_type must be "full" or "safe", got "{{ upgrade_type | default('full') }}".
+      when: (upgrade_type | default('full')) not in ['full', 'safe']
+
+    - name: Display current node status
+      command: kubectl get nodes -o wide
+      changed_when: false
+      register: node_status
+
+    - name: Show node status
+      debug:
+        var: node_status.stdout_lines
+
+    - name: Check if Flux is installed
+      command: which flux
+      changed_when: false
+      register: flux_check
+      ignore_errors: true
+
+    - name: Suspend Flux kustomizations
+      command: flux suspend kustomization --all
+      when: flux_check.rc == 0
+
+########################################################################
+# Play 3 — Upgrade control plane nodes (one at a time)
+########################################################################
+- name: OS upgrade — control plane nodes
+  hosts: kube_server
+  serial: 1
+  become: true
+  remote_user: debian
+  any_errors_fatal: true
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Upgrade control plane OS
+      vars:
+        _reboot_after_upgrade: "{{ reboot_after_upgrade | default(true) }}"
+        _upgrade_type: "{{ upgrade_type | default('full') }}"
+      block:
+        - name: Resolve Kubernetes node name for this host
+          shell: >
+            kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name} {.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+            | awk '$2 == "{{ ansible_default_ipv4.address | default(inventory_hostname) }}" { print $1 }'
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: k8s_node_name_result
+
+        - name: Fail if Kubernetes node name could not be resolved
+          fail:
+            msg: >-
+              Could not resolve Kubernetes node name for {{ inventory_hostname }}.
+              Check: kubectl get nodes -o wide
+          when: k8s_node_name_result.stdout | trim == ""
+
+        - name: Set k8s_node_name fact
+          set_fact:
+            k8s_node_name: "{{ k8s_node_name_result.stdout | trim }}"
+
+        - name: Update apt cache
+          apt:
+            update_cache: yes
+            cache_valid_time: 0
+
+        - name: Check for available updates
+          command: "apt-get -s {{ 'dist-upgrade' if _upgrade_type == 'full' else 'upgrade' }}"
+          changed_when: false
+          register: apt_simulate
+          environment:
+            LC_ALL: C
+
+        - name: Check if reboot is already pending
+          stat:
+            path: /var/run/reboot-required
+          register: reboot_pending_before
+
+        - name: Check if node is currently cordoned
+          shell: "kubectl get node {{ k8s_node_name }} -o jsonpath='{.spec.unschedulable}'"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: node_cordoned
+
+        - name: Determine if node needs work
+          set_fact:
+            node_needs_work: "{{ (apt_simulate.stdout | regex_search('(\\d+) upgraded', '\\1') | default(['0']) | first) | int > 0
+                                or ((_reboot_after_upgrade | bool) and reboot_pending_before.stat.exists)
+                                or (node_cordoned.stdout | default('') | trim == 'true') }}"
+
+        - name: Skip message
+          debug:
+            msg: "No updates available, no pending reboot, and node not cordoned — skipping {{ k8s_node_name }}"
+          when: not node_needs_work | bool
+
+        - name: Drain node
+          command: "kubectl drain {{ k8s_node_name }} --ignore-daemonsets --delete-emptydir-data --timeout=300s"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          register: drain_result
+          until: drain_result.rc == 0
+          retries: 3
+          delay: 30
+          when: node_needs_work | bool
+
+        - name: Run apt dist-upgrade
+          apt:
+            upgrade: dist
+            force_apt_get: yes
+          when: node_needs_work | bool and _upgrade_type == "full"
+
+        - name: Run apt upgrade (safe)
+          apt:
+            upgrade: "yes"
+            force_apt_get: yes
+          when: node_needs_work | bool and _upgrade_type == "safe"
+
+        - name: Remove unnecessary packages
+          apt:
+            autoremove: yes
+            purge: yes
+          when: node_needs_work | bool
+
+        - name: Check if reboot is required
+          stat:
+            path: /var/run/reboot-required
+          register: reboot_required
+          when: node_needs_work | bool
+
+        - name: Reboot node
+          reboot:
+            msg: "OS upgrade reboot"
+            reboot_timeout: 600
+          when: node_needs_work | bool and (_reboot_after_upgrade | bool) and (reboot_required.stat.exists | default(false))
+
+        - name: Wait for kubelet to be ready
+          command: systemctl is-active kubelet
+          register: kubelet_status
+          until: kubelet_status.rc == 0
+          retries: 30
+          delay: 10
+          changed_when: false
+          when: node_needs_work | bool
+
+        - name: Wait for API server to be ready
+          command: kubectl get --raw /readyz
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: api_ready
+          until: api_ready.rc == 0
+          retries: 30
+          delay: 10
+          when: node_needs_work | bool
+
+        - name: Uncordon node
+          command: "kubectl uncordon {{ k8s_node_name }}"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          register: uncordon_result
+          until: uncordon_result.rc == 0
+          retries: 6
+          delay: 10
+          when: node_needs_work | bool
+
+        - name: Wait for node to become Ready
+          command: "kubectl wait --for=condition=Ready node/{{ k8s_node_name }} --timeout=300s"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          when: node_needs_work | bool
+
+      rescue:
+        - name: Pick a healthy CP for rescue commands
+          set_fact:
+            rescue_delegate: >-
+              {{ groups['kube_server'] | reject('equalto', inventory_hostname) | list
+                 | first | default(inventory_hostname) }}
+
+        - name: Attempt to uncordon node after failure
+          command: "kubectl uncordon {{ k8s_node_name | default(inventory_hostname) }}"
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          ignore_errors: true
+
+        - name: Check if Flux is installed (rescue)
+          command: which flux
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          changed_when: false
+          register: flux_check_rescue
+          ignore_errors: true
+
+        - name: Resume Flux kustomizations after failure
+          command: flux resume kustomization --all
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          changed_when: false
+          when: flux_check_rescue.rc == 0
+          ignore_errors: true
+
+        - name: Fail with OS upgrade error
+          fail:
+            msg: >-
+              OS upgrade failed on {{ inventory_hostname }}
+              (k8s node: {{ k8s_node_name | default('unknown') }}).
+              Best-effort uncordon and Flux resume attempted (via {{ rescue_delegate }}).
+              Verify node state with: kubectl get nodes
+              Investigate and re-run.
+
+########################################################################
+# Play 4 — Upgrade worker nodes (one at a time)
+########################################################################
+- name: OS upgrade — worker nodes
+  hosts: kube_agents
+  serial: 1
+  become: true
+  remote_user: debian
+  any_errors_fatal: true
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Upgrade worker OS
+      vars:
+        _reboot_after_upgrade: "{{ reboot_after_upgrade | default(true) }}"
+        _upgrade_type: "{{ upgrade_type | default('full') }}"
+      block:
+        - name: Resolve Kubernetes node name for this host
+          shell: >
+            kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name} {.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+            | awk '$2 == "{{ ansible_default_ipv4.address | default(inventory_hostname) }}" { print $1 }'
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: k8s_node_name_result
+
+        - name: Fail if Kubernetes node name could not be resolved
+          fail:
+            msg: >-
+              Could not resolve Kubernetes node name for {{ inventory_hostname }}.
+              Check: kubectl get nodes -o wide
+          when: k8s_node_name_result.stdout | trim == ""
+
+        - name: Set k8s_node_name fact
+          set_fact:
+            k8s_node_name: "{{ k8s_node_name_result.stdout | trim }}"
+
+        - name: Update apt cache
+          apt:
+            update_cache: yes
+            cache_valid_time: 0
+
+        - name: Check for available updates
+          command: "apt-get -s {{ 'dist-upgrade' if _upgrade_type == 'full' else 'upgrade' }}"
+          changed_when: false
+          register: apt_simulate
+          environment:
+            LC_ALL: C
+
+        - name: Check if reboot is already pending
+          stat:
+            path: /var/run/reboot-required
+          register: reboot_pending_before
+
+        - name: Check if node is currently cordoned
+          shell: "kubectl get node {{ k8s_node_name }} -o jsonpath='{.spec.unschedulable}'"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: node_cordoned
+
+        - name: Determine if node needs work
+          set_fact:
+            node_needs_work: "{{ (apt_simulate.stdout | regex_search('(\\d+) upgraded', '\\1') | default(['0']) | first) | int > 0
+                                or ((_reboot_after_upgrade | bool) and reboot_pending_before.stat.exists)
+                                or (node_cordoned.stdout | default('') | trim == 'true') }}"
+
+        - name: Skip message
+          debug:
+            msg: "No updates available, no pending reboot, and node not cordoned — skipping {{ k8s_node_name }}"
+          when: not node_needs_work | bool
+
+        - name: Drain worker node
+          command: "kubectl drain {{ k8s_node_name }} --ignore-daemonsets --delete-emptydir-data --disable-eviction --timeout=300s"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          register: drain_result
+          until: drain_result.rc == 0
+          retries: 3
+          delay: 30
+          when: node_needs_work | bool
+
+        - name: Run apt dist-upgrade
+          apt:
+            upgrade: dist
+            force_apt_get: yes
+          when: node_needs_work | bool and _upgrade_type == "full"
+
+        - name: Run apt upgrade (safe)
+          apt:
+            upgrade: "yes"
+            force_apt_get: yes
+          when: node_needs_work | bool and _upgrade_type == "safe"
+
+        - name: Remove unnecessary packages
+          apt:
+            autoremove: yes
+            purge: yes
+          when: node_needs_work | bool
+
+        - name: Check if reboot is required
+          stat:
+            path: /var/run/reboot-required
+          register: reboot_required
+          when: node_needs_work | bool
+
+        - name: Reboot node
+          reboot:
+            msg: "OS upgrade reboot"
+            reboot_timeout: 600
+          when: node_needs_work | bool and (_reboot_after_upgrade | bool) and (reboot_required.stat.exists | default(false))
+
+        - name: Wait for kubelet to be ready
+          command: systemctl is-active kubelet
+          register: kubelet_status
+          until: kubelet_status.rc == 0
+          retries: 30
+          delay: 10
+          changed_when: false
+          when: node_needs_work | bool
+
+        - name: Wait for API server to be ready
+          command: kubectl get --raw /readyz
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: api_ready
+          until: api_ready.rc == 0
+          retries: 30
+          delay: 10
+          when: node_needs_work | bool
+
+        - name: Uncordon worker node
+          command: "kubectl uncordon {{ k8s_node_name }}"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          register: uncordon_result
+          until: uncordon_result.rc == 0
+          retries: 6
+          delay: 10
+          when: node_needs_work | bool
+
+        - name: Wait for worker node to become Ready
+          command: "kubectl wait --for=condition=Ready node/{{ k8s_node_name }} --timeout=300s"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          when: node_needs_work | bool
+
+      rescue:
+        - name: Pick a healthy CP for rescue commands
+          set_fact:
+            rescue_delegate: "{{ groups['kube_server'][0] }}"
+
+        - name: Attempt to uncordon worker after failure
+          command: "kubectl uncordon {{ k8s_node_name | default(inventory_hostname) }}"
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          ignore_errors: true
+
+        - name: Check if Flux is installed (rescue)
+          command: which flux
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          changed_when: false
+          register: flux_check_rescue
+          ignore_errors: true
+
+        - name: Resume Flux kustomizations after failure
+          command: flux resume kustomization --all
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          changed_when: false
+          when: flux_check_rescue.rc == 0
+          ignore_errors: true
+
+        - name: Fail with OS upgrade error
+          fail:
+            msg: >-
+              OS upgrade failed on {{ inventory_hostname }}
+              (k8s node: {{ k8s_node_name | default('unknown') }}).
+              Best-effort uncordon and Flux resume attempted (via {{ rescue_delegate }}).
+              Verify node state with: kubectl get nodes
+              Investigate and re-run.
+
+########################################################################
+# Play 5 — Post-flight checks
+########################################################################
+- name: OS upgrade post-flight checks
+  hosts: kube_server[0]
+  become: false
+  remote_user: debian
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Post-flight
+      block:
+        - name: Verify all nodes are Ready
+          command: kubectl get nodes -o wide
+          changed_when: false
+          register: final_node_status
+
+        - name: Display final node status
+          debug:
+            var: final_node_status.stdout_lines
+
+        - name: Check for NotReady nodes
+          shell: kubectl get nodes --no-headers | grep -v ' Ready' || true
+          changed_when: false
+          register: not_ready_post
+
+        - name: Fail if any nodes are not Ready after upgrade
+          fail:
+            msg: >-
+              Some nodes are not Ready after OS upgrade:
+              {{ not_ready_post.stdout }}
+          when: not_ready_post.stdout | trim != ""
+
+        - name: Check for unhealthy pods
+          shell: kubectl get pods -A --no-headers | grep -v Running | grep -v Completed || true
+          changed_when: false
+          register: unhealthy_pods
+
+        - name: Display unhealthy pods
+          debug:
+            var: unhealthy_pods.stdout_lines
+          when: unhealthy_pods.stdout | length > 0
+
+        - name: Check if Flux is installed
+          command: which flux
+          changed_when: false
+          register: flux_check
+          ignore_errors: true
+
+        - name: Resume Flux kustomizations
+          command: flux resume kustomization --all
+          when: flux_check.rc == 0
+
+        - name: OS upgrade complete
+          debug:
+            msg: "Rolling OS upgrade completed successfully on all nodes."
+
+      rescue:
+        - name: Check if Flux is installed (rescue)
+          command: which flux
+          changed_when: false
+          register: flux_check_rescue
+          ignore_errors: true
+
+        - name: Resume Flux kustomizations after post-flight failure
+          command: flux resume kustomization --all
+          changed_when: false
+          when: flux_check_rescue.rc == 0
+          ignore_errors: true
+
+        - name: Fail with post-flight error
+          fail:
+            msg: >-
+              Post-flight checks failed. The OS upgrade itself completed but
+              verification encountered an error. Flux resume attempted.
+              Run manually: kubectl get nodes && flux resume kustomization --all
