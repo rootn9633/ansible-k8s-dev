@@ -1,0 +1,52 @@
+---
+# Shared task file: render /etc/containerd/config.toml from the installed
+# containerd binary's built-in default and enable the systemd cgroup driver.
+#
+# The generated config's `version` follows the installed binary — version 2
+# for containerd 1.x, version 3 for containerd 2.x — so this is correct across
+# a major containerd upgrade. It flips the default `SystemdCgroup = false` to
+# `true` by value (not by section anchor), so it works regardless of schema.
+#
+# Included by install_kubernetes_dependencies.yml (initial provisioning) and
+# upgrade_containerd.yml (runtime upgrade). The previous config is backed up by
+# the copy module; containerd is restarted only when the rendered config
+# actually changes, then verified active.
+
+- name: Ensure /etc/containerd exists
+  ansible.builtin.file:
+    path: /etc/containerd
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Generate containerd default config (schema follows installed binary)
+  ansible.builtin.command: containerd config default
+  changed_when: false
+  register: containerd_default_config
+
+- name: Render containerd config with the systemd cgroup driver enabled
+  ansible.builtin.copy:
+    content: "{{ containerd_default_config.stdout | regex_replace('SystemdCgroup = false', 'SystemdCgroup = true') }}"
+    dest: /etc/containerd/config.toml
+    owner: root
+    group: root
+    mode: "0644"
+    backup: true
+  register: containerd_config_render
+
+- name: Restart containerd to apply the regenerated config
+  ansible.builtin.systemd:
+    name: containerd
+    state: restarted
+    enabled: true
+    daemon_reload: true
+  when: containerd_config_render is changed
+
+- name: Verify containerd is active
+  ansible.builtin.command: systemctl is-active containerd
+  changed_when: false
+  register: containerd_active_check
+  retries: 5
+  delay: 3
+  until: containerd_active_check.rc == 0

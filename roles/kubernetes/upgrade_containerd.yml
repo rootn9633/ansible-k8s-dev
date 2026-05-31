@@ -1,24 +1,29 @@
 ---
-# Rolling OS upgrade playbook — upgrades all apt packages and reboots
-# each node one at a time, draining workloads first to avoid disruption.
+# Dedicated container-runtime upgrade — moves nodes to containerd 2.x and
+# regenerates /etc/containerd/config.toml to the v3 schema, one node at a time,
+# draining first. This is intentionally SEPARATE from upgrade_os.yml: OS
+# patching holds containerd (see the holds in upgrade_os.yml) so it never does
+# a surprise major runtime jump; this playbook is the deliberate, tested path
+# for that jump.
+#
+# In-place by design (NO reboot): the standard runtime-upgrade procedure is
+# drain -> upgrade package -> restart containerd -> uncordon. Skipping the
+# reboot avoids the ~5 min kubelet-startup DiskPressure blip and, on control
+# plane nodes, keeps etcd/apiserver static pods running through the restart
+# (containerd preserves running containers across a restart via shim survival).
+# If you also want a kernel/OS refresh, run upgrade_os.yml afterwards.
+#
+# Idempotent: a node already on containerd 2.x with a v3 config is skipped, so
+# re-running is safe and a node validated as a canary is a no-op.
 #
 # Usage:
-#   ansible-playbook -i dev_hosts.yml roles/kubernetes/upgrade_os.yml
-#
-# Optional variables:
-#   reboot_after_upgrade: true   — set to false to skip reboot
-#   upgrade_type: "full"         — "full" (dist-upgrade) or "safe" (upgrade)
+#   ansible-playbook -i dev_hosts.yml roles/kubernetes/upgrade_containerd.yml
+#   # canary a single node first:
+#   ansible-playbook -i dev_hosts.yml roles/kubernetes/upgrade_containerd.yml --limit 192.168.3.41
 
 ########################################################################
 # Play 1 — Ensure control-plane kubeconfig is current and HA
 ########################################################################
-# kubeadm cert renewal (e.g. during a Kubernetes upgrade) regenerates
-# /etc/kubernetes/admin.conf but leaves the debian user's ~/.kube/config
-# stale, breaking every kubectl call below. Refresh it here so the run
-# is self-healing. Runs on all control-plane nodes (not just
-# kube_server[0]) so the rescue path — which delegates to a peer CP
-# node — also has a working kubeconfig. The server is pointed at the
-# keepalived VIP so kubectl survives any single CP node being down.
 - name: Ensure control-plane kubeconfig is current and HA
   hosts: kube_server
   become: true
@@ -48,9 +53,9 @@
         mode: "0600"
 
 ########################################################################
-# Play 2 — Pre-flight checks
+# Play 2 — Pre-flight checks + suspend Flux
 ########################################################################
-- name: OS upgrade pre-flight checks
+- name: Containerd upgrade pre-flight checks
   hosts: kube_server[0]
   become: false
   remote_user: debian
@@ -67,17 +72,11 @@
     - name: Fail if any nodes are not Ready
       fail:
         msg: >-
-          Some nodes are not Ready. Resolve before upgrading OS:
+          Some nodes are not Ready. Resolve before upgrading containerd:
           {{ not_ready_nodes.stdout }}
       when: not_ready_nodes.stdout | trim != ""
 
-    - name: Validate upgrade_type
-      fail:
-        msg: >-
-          upgrade_type must be "full" or "safe", got "{{ upgrade_type | default('full') }}".
-      when: (upgrade_type | default('full')) not in ['full', 'safe']
-
-    - name: Display current node status
+    - name: Display current node status and runtime versions
       command: kubectl get nodes -o wide
       changed_when: false
       register: node_status
@@ -101,9 +100,9 @@
       when: flux_check.rc == 0
 
 ########################################################################
-# Play 3 — Upgrade control plane nodes (one at a time)
+# Play 3 — Upgrade control-plane containerd (one at a time)
 ########################################################################
-- name: OS upgrade — control plane nodes
+- name: Containerd upgrade — control plane nodes
   hosts: kube_server
   serial: 1
   become: true
@@ -113,10 +112,12 @@
     KUBECONFIG: "{{ home_dir }}/.kube/config"
 
   tasks:
-    - name: Upgrade control plane OS
+    - name: Upgrade control-plane containerd
       vars:
-        _reboot_after_upgrade: "{{ reboot_after_upgrade | default(true) }}"
-        _upgrade_type: "{{ upgrade_type | default('full') }}"
+        _runtime_packages:
+          - containerd.io
+          - cri-tools
+          - kubernetes-cni
       block:
         - name: Resolve Kubernetes node name for this host
           shell: >
@@ -138,52 +139,26 @@
           set_fact:
             k8s_node_name: "{{ k8s_node_name_result.stdout | trim }}"
 
-        - name: Update apt cache
-          apt:
-            update_cache: yes
-            cache_valid_time: 0
-
-        # The container runtime is deliberately excluded from OS patching so a
-        # routine upgrade never does a surprise major containerd jump. The
-        # runtime is upgraded via the dedicated upgrade_containerd.yml. Holding
-        # here (before the simulate) also keeps these out of the update count.
-        - name: Hold container runtime packages (managed by upgrade_containerd.yml)
-          dpkg_selections:
-            name: "{{ item }}"
-            selection: hold
-          loop:
-            - containerd.io
-            - cri-tools
-            - kubernetes-cni
-
-        - name: Check for available updates
-          command: "apt-get -s {{ 'dist-upgrade' if _upgrade_type == 'full' else 'upgrade' }}"
+        - name: Check installed containerd version
+          command: containerd --version
           changed_when: false
-          register: apt_simulate
-          environment:
-            LC_ALL: C
+          register: containerd_installed_version
 
-        - name: Check if reboot is already pending
-          stat:
-            path: /var/run/reboot-required
-          register: reboot_pending_before
-
-        - name: Check if node is currently cordoned
-          shell: "kubectl get node {{ k8s_node_name }} -o jsonpath='{.spec.unschedulable}'"
-          delegate_to: "{{ groups['kube_server'][0] }}"
-          become: false
+        - name: Check current containerd config schema version
+          command: grep -m1 '^version' /etc/containerd/config.toml
           changed_when: false
-          register: node_cordoned
+          failed_when: false
+          register: containerd_cfg_version
 
-        - name: Determine if node needs work
+        - name: Determine whether this node needs the containerd upgrade
           set_fact:
-            node_needs_work: "{{ (apt_simulate.stdout | regex_search('(\\d+) upgraded', '\\1') | default(['0']) | first) | int > 0
-                                or ((_reboot_after_upgrade | bool) and reboot_pending_before.stat.exists)
-                                or (node_cordoned.stdout | default('') | trim == 'true') }}"
+            node_needs_work: >-
+              {{ (containerd_installed_version.stdout is not search('containerd.io 2\.'))
+                 or ('version = 3' not in containerd_cfg_version.stdout) }}
 
         - name: Skip message
           debug:
-            msg: "No updates available, no pending reboot, and node not cordoned — skipping {{ k8s_node_name }}"
+            msg: "Already on containerd 2.x with a v3 config — skipping {{ k8s_node_name }}"
           when: not node_needs_work | bool
 
         - name: Drain node
@@ -196,48 +171,29 @@
           delay: 30
           when: node_needs_work | bool
 
-        - name: Run apt dist-upgrade
-          apt:
-            upgrade: dist
-            force_apt_get: yes
-          when: node_needs_work | bool and _upgrade_type == "full"
-
-        - name: Run apt upgrade (safe)
-          apt:
-            upgrade: "yes"
-            force_apt_get: yes
-          when: node_needs_work | bool and _upgrade_type == "safe"
-
-        - name: Remove unnecessary packages
-          apt:
-            autoremove: yes
-            purge: yes
+        - name: Unhold runtime packages
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: install
+          loop: "{{ _runtime_packages }}"
           when: node_needs_work | bool
 
-        - name: Clean apt package cache
-          command: apt-get clean
-          changed_when: false
+        - name: Upgrade containerd and runtime tooling to latest
+          apt:
+            name: "{{ _runtime_packages }}"
+            state: latest
+            update_cache: yes
           when: node_needs_work | bool
 
-        - name: Check if reboot is required
-          stat:
-            path: /var/run/reboot-required
-          register: reboot_required
+        - name: Regenerate containerd config (v3 schema) and restart
+          include_tasks: tasks/containerd_config.yml
           when: node_needs_work | bool
 
-        - name: Reboot node
-          reboot:
-            msg: "OS upgrade reboot"
-            reboot_timeout: 600
-          when: node_needs_work | bool and (_reboot_after_upgrade | bool) and (reboot_required.stat.exists | default(false))
-
-        - name: Wait for kubelet to be ready
-          command: systemctl is-active kubelet
-          register: kubelet_status
-          until: kubelet_status.rc == 0
-          retries: 30
-          delay: 10
-          changed_when: false
+        - name: Re-hold runtime packages
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop: "{{ _runtime_packages }}"
           when: node_needs_work | bool
 
         - name: Wait for API server to be ready
@@ -299,19 +255,19 @@
           when: flux_check_rescue.rc == 0
           ignore_errors: true
 
-        - name: Fail with OS upgrade error
+        - name: Fail with containerd upgrade error
           fail:
             msg: >-
-              OS upgrade failed on {{ inventory_hostname }}
+              Containerd upgrade failed on {{ inventory_hostname }}
               (k8s node: {{ k8s_node_name | default('unknown') }}).
-              Best-effort uncordon and Flux resume attempted (via {{ rescue_delegate }}).
-              Verify node state with: kubectl get nodes
+              Best-effort uncordon and Flux resume attempted (via {{ rescue_delegate }} / control node).
+              Verify with: kubectl get nodes -o wide && systemctl status containerd
               Investigate and re-run.
 
 ########################################################################
-# Play 4 — Upgrade worker nodes (one at a time)
+# Play 4 — Upgrade worker containerd (one at a time)
 ########################################################################
-- name: OS upgrade — worker nodes
+- name: Containerd upgrade — worker nodes
   hosts: kube_agents
   serial: 1
   become: true
@@ -321,10 +277,12 @@
     KUBECONFIG: "{{ home_dir }}/.kube/config"
 
   tasks:
-    - name: Upgrade worker OS
+    - name: Upgrade worker containerd
       vars:
-        _reboot_after_upgrade: "{{ reboot_after_upgrade | default(true) }}"
-        _upgrade_type: "{{ upgrade_type | default('full') }}"
+        _runtime_packages:
+          - containerd.io
+          - cri-tools
+          - kubernetes-cni
       block:
         - name: Resolve Kubernetes node name for this host
           shell: >
@@ -346,52 +304,26 @@
           set_fact:
             k8s_node_name: "{{ k8s_node_name_result.stdout | trim }}"
 
-        - name: Update apt cache
-          apt:
-            update_cache: yes
-            cache_valid_time: 0
-
-        # The container runtime is deliberately excluded from OS patching so a
-        # routine upgrade never does a surprise major containerd jump. The
-        # runtime is upgraded via the dedicated upgrade_containerd.yml. Holding
-        # here (before the simulate) also keeps these out of the update count.
-        - name: Hold container runtime packages (managed by upgrade_containerd.yml)
-          dpkg_selections:
-            name: "{{ item }}"
-            selection: hold
-          loop:
-            - containerd.io
-            - cri-tools
-            - kubernetes-cni
-
-        - name: Check for available updates
-          command: "apt-get -s {{ 'dist-upgrade' if _upgrade_type == 'full' else 'upgrade' }}"
+        - name: Check installed containerd version
+          command: containerd --version
           changed_when: false
-          register: apt_simulate
-          environment:
-            LC_ALL: C
+          register: containerd_installed_version
 
-        - name: Check if reboot is already pending
-          stat:
-            path: /var/run/reboot-required
-          register: reboot_pending_before
-
-        - name: Check if node is currently cordoned
-          shell: "kubectl get node {{ k8s_node_name }} -o jsonpath='{.spec.unschedulable}'"
-          delegate_to: "{{ groups['kube_server'][0] }}"
-          become: false
+        - name: Check current containerd config schema version
+          command: grep -m1 '^version' /etc/containerd/config.toml
           changed_when: false
-          register: node_cordoned
+          failed_when: false
+          register: containerd_cfg_version
 
-        - name: Determine if node needs work
+        - name: Determine whether this node needs the containerd upgrade
           set_fact:
-            node_needs_work: "{{ (apt_simulate.stdout | regex_search('(\\d+) upgraded', '\\1') | default(['0']) | first) | int > 0
-                                or ((_reboot_after_upgrade | bool) and reboot_pending_before.stat.exists)
-                                or (node_cordoned.stdout | default('') | trim == 'true') }}"
+            node_needs_work: >-
+              {{ (containerd_installed_version.stdout is not search('containerd.io 2\.'))
+                 or ('version = 3' not in containerd_cfg_version.stdout) }}
 
         - name: Skip message
           debug:
-            msg: "No updates available, no pending reboot, and node not cordoned — skipping {{ k8s_node_name }}"
+            msg: "Already on containerd 2.x with a v3 config — skipping {{ k8s_node_name }}"
           when: not node_needs_work | bool
 
         - name: Drain worker node
@@ -404,59 +336,38 @@
           delay: 30
           when: node_needs_work | bool
 
-        - name: Run apt dist-upgrade
-          apt:
-            upgrade: dist
-            force_apt_get: yes
-          when: node_needs_work | bool and _upgrade_type == "full"
-
-        - name: Run apt upgrade (safe)
-          apt:
-            upgrade: "yes"
-            force_apt_get: yes
-          when: node_needs_work | bool and _upgrade_type == "safe"
-
-        - name: Remove unnecessary packages
-          apt:
-            autoremove: yes
-            purge: yes
+        - name: Unhold runtime packages
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: install
+          loop: "{{ _runtime_packages }}"
           when: node_needs_work | bool
 
-        - name: Clean apt package cache
-          command: apt-get clean
-          changed_when: false
+        - name: Upgrade containerd and runtime tooling to latest
+          apt:
+            name: "{{ _runtime_packages }}"
+            state: latest
+            update_cache: yes
           when: node_needs_work | bool
 
-        - name: Check if reboot is required
-          stat:
-            path: /var/run/reboot-required
-          register: reboot_required
+        - name: Regenerate containerd config (v3 schema) and restart
+          include_tasks: tasks/containerd_config.yml
           when: node_needs_work | bool
 
-        - name: Reboot node
-          reboot:
-            msg: "OS upgrade reboot"
-            reboot_timeout: 600
-          when: node_needs_work | bool and (_reboot_after_upgrade | bool) and (reboot_required.stat.exists | default(false))
+        - name: Re-hold runtime packages
+          dpkg_selections:
+            name: "{{ item }}"
+            selection: hold
+          loop: "{{ _runtime_packages }}"
+          when: node_needs_work | bool
 
-        - name: Wait for kubelet to be ready
+        - name: Wait for kubelet to be active
           command: systemctl is-active kubelet
           register: kubelet_status
           until: kubelet_status.rc == 0
           retries: 30
           delay: 10
           changed_when: false
-          when: node_needs_work | bool
-
-        - name: Wait for API server to be ready
-          command: kubectl get --raw /readyz
-          delegate_to: "{{ groups['kube_server'][0] }}"
-          become: false
-          changed_when: false
-          register: api_ready
-          until: api_ready.rc == 0
-          retries: 30
-          delay: 10
           when: node_needs_work | bool
 
         - name: Uncordon worker node
@@ -476,14 +387,11 @@
           changed_when: false
           when: node_needs_work | bool
 
-        # Force-draining (--disable-eviction above) stops this node's Longhorn
-        # replicas ungracefully, leaving its volumes degraded until they rebuild
-        # from the healthy peer. The node going k8s-Ready does NOT mean those
-        # rebuilds are done. With serial:1 and only two workers, draining the
-        # next worker while a 2-replica volume is still degraded would leave it
-        # with zero healthy replicas — the one scenario that risks data loss.
-        # Gate the serial loop here until no volume is degraded/faulted. No-op
-        # (passes immediately) on clusters without Longhorn installed.
+        # Draining force-stopped this node's Longhorn replicas; they rebuild
+        # from the healthy peer after it returns. With serial:1 and two workers,
+        # draining the next worker before this one's volumes are healthy would
+        # leave a 2-replica volume with zero healthy replicas. Gate on volume
+        # health. No-op (passes immediately) on clusters without Longhorn.
         - name: Wait for Longhorn volumes to finish rebuilding before next node
           shell: >-
             kubectl -n longhorn-system get volumes.longhorn.io
@@ -527,19 +435,19 @@
           when: flux_check_rescue.rc == 0
           ignore_errors: true
 
-        - name: Fail with OS upgrade error
+        - name: Fail with containerd upgrade error
           fail:
             msg: >-
-              OS upgrade failed on {{ inventory_hostname }}
+              Containerd upgrade failed on {{ inventory_hostname }}
               (k8s node: {{ k8s_node_name | default('unknown') }}).
-              Best-effort uncordon and Flux resume attempted (via {{ rescue_delegate }}).
-              Verify node state with: kubectl get nodes
+              Best-effort uncordon and Flux resume attempted (via {{ rescue_delegate }} / control node).
+              Verify with: kubectl get nodes -o wide && systemctl status containerd
               Investigate and re-run.
 
 ########################################################################
-# Play 5 — Post-flight checks
+# Play 5 — Post-flight checks + resume Flux
 ########################################################################
-- name: OS upgrade post-flight checks
+- name: Containerd upgrade post-flight checks
   hosts: kube_server[0]
   become: false
   remote_user: debian
@@ -549,7 +457,7 @@
   tasks:
     - name: Post-flight
       block:
-        - name: Verify all nodes are Ready
+        - name: Verify all nodes are Ready with their runtime versions
           command: kubectl get nodes -o wide
           changed_when: false
           register: final_node_status
@@ -566,7 +474,7 @@
         - name: Fail if any nodes are not Ready after upgrade
           fail:
             msg: >-
-              Some nodes are not Ready after OS upgrade:
+              Some nodes are not Ready after the containerd upgrade:
               {{ not_ready_post.stdout }}
           when: not_ready_post.stdout | trim != ""
 
@@ -575,7 +483,7 @@
           changed_when: false
           register: unhealthy_pods
 
-        - name: Display unhealthy pods
+        - name: Display unhealthy pods (tombstones from drains are expected; judge by workload readiness)
           debug:
             var: unhealthy_pods.stdout_lines
           when: unhealthy_pods.stdout | length > 0
@@ -594,9 +502,9 @@
             KUBECONFIG: "{{ control_node_kubeconfig }}"
           when: flux_check.rc == 0
 
-        - name: OS upgrade complete
+        - name: Containerd upgrade complete
           debug:
-            msg: "Rolling OS upgrade completed successfully on all nodes."
+            msg: "Containerd upgrade completed. Verify runtime versions in the node status above."
 
       rescue:
         - name: Check if Flux CLI is available on the control node (rescue)
@@ -618,6 +526,6 @@
         - name: Fail with post-flight error
           fail:
             msg: >-
-              Post-flight checks failed. The OS upgrade itself completed but
-              verification encountered an error. Flux resume attempted.
-              Run manually: kubectl get nodes && flux resume kustomization --all
+              Post-flight checks failed. The containerd upgrade itself may have
+              completed but verification hit an error. Flux resume attempted.
+              Run manually: kubectl get nodes -o wide && flux resume kustomization --all
