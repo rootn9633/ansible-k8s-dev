@@ -86,14 +86,18 @@
       debug:
         var: node_status.stdout_lines
 
-    - name: Check if Flux is installed
+    - name: Check if Flux CLI is available on the control node
       command: which flux
+      delegate_to: localhost
       changed_when: false
       register: flux_check
       ignore_errors: true
 
     - name: Suspend Flux kustomizations
       command: flux suspend kustomization --all
+      delegate_to: localhost
+      environment:
+        KUBECONFIG: "{{ control_node_kubeconfig }}"
       when: flux_check.rc == 0
 
 ########################################################################
@@ -259,9 +263,9 @@
           become: false
           ignore_errors: true
 
-        - name: Check if Flux is installed (rescue)
+        - name: Check if Flux CLI is available on the control node (rescue)
           command: which flux
-          delegate_to: "{{ rescue_delegate }}"
+          delegate_to: localhost
           become: false
           changed_when: false
           register: flux_check_rescue
@@ -269,9 +273,11 @@
 
         - name: Resume Flux kustomizations after failure
           command: flux resume kustomization --all
-          delegate_to: "{{ rescue_delegate }}"
+          delegate_to: localhost
           become: false
           changed_when: false
+          environment:
+            KUBECONFIG: "{{ control_node_kubeconfig }}"
           when: flux_check_rescue.rc == 0
           ignore_errors: true
 
@@ -467,9 +473,9 @@
           become: false
           ignore_errors: true
 
-        - name: Check if Flux is installed (rescue)
+        - name: Check if Flux CLI is available on the control node (rescue)
           command: which flux
-          delegate_to: "{{ rescue_delegate }}"
+          delegate_to: localhost
           become: false
           changed_when: false
           register: flux_check_rescue
@@ -477,9 +483,11 @@
 
         - name: Resume Flux kustomizations after failure
           command: flux resume kustomization --all
-          delegate_to: "{{ rescue_delegate }}"
+          delegate_to: localhost
           become: false
           changed_when: false
+          environment:
+            KUBECONFIG: "{{ control_node_kubeconfig }}"
           when: flux_check_rescue.rc == 0
           ignore_errors: true
 
@@ -536,14 +544,18 @@
             var: unhealthy_pods.stdout_lines
           when: unhealthy_pods.stdout | length > 0
 
-        - name: Check if Flux is installed
+        - name: Check if Flux CLI is available on the control node
           command: which flux
+          delegate_to: localhost
           changed_when: false
           register: flux_check
           ignore_errors: true
 
         - name: Resume Flux kustomizations
           command: flux resume kustomization --all
+          delegate_to: localhost
+          environment:
+            KUBECONFIG: "{{ control_node_kubeconfig }}"
           when: flux_check.rc == 0
 
         - name: OS upgrade complete
@@ -551,14 +563,18 @@
             msg: "Rolling OS upgrade completed successfully on all nodes."
 
       rescue:
-        - name: Check if Flux is installed (rescue)
+        - name: Check if Flux CLI is available on the control node (rescue)
           command: which flux
+          delegate_to: localhost
           changed_when: false
           register: flux_check_rescue
           ignore_errors: true
 
         - name: Resume Flux kustomizations after post-flight failure
           command: flux resume kustomization --all
+          delegate_to: localhost
+          environment:
+            KUBECONFIG: "{{ control_node_kubeconfig }}"
           changed_when: false
           when: flux_check_rescue.rc == 0
           ignore_errors: true

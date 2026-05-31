@@ -12,3 +12,10 @@ join_command_worker_location: "join_command_worker.out"
 
 # setting the home directory for retreiving, saving, and executing files
 home_dir: "/home/debian"
+
+# kubeconfig on the Ansible control node (this workstation), used to run the
+# flux CLI against the cluster during upgrades. The flux CLI is expected on the
+# control node (standard GitOps operator setup), NOT on the cluster nodes —
+# upgrade_os.yml delegates its flux suspend/resume tasks to localhost.
+# Honours an exported KUBECONFIG, otherwise falls back to ~/.kube/config.
+control_node_kubeconfig: "{{ lookup('env', 'KUBECONFIG') or (lookup('env', 'HOME') ~ '/.kube/config') }}"
