@@ -350,6 +350,20 @@
             - kubectl
           when: node_needs_upgrade | bool
 
+        # The --pod-infra-container-image kubelet flag was removed in v1.35;
+        # a 1.35+ kubelet refuses to start if it is still present in
+        # kubeadm-flags.env. Older kubeadm wrote it at bootstrap and never
+        # strips it, and auto-removal during `kubeadm upgrade` has been
+        # unreliable (kubeadm#3281). Strip it explicitly after kubeadm has
+        # regenerated the file and before the upgraded kubelet restarts.
+        # Idempotent no-op once the flag is gone.
+        - name: Remove deprecated --pod-infra-container-image kubelet flag
+          replace:
+            path: /var/lib/kubelet/kubeadm-flags.env
+            regexp: '\s*--pod-infra-container-image=\S+'
+            replace: ''
+          when: node_needs_upgrade | bool
+
         - name: Restart kubelet
           service:
             name: kubelet
@@ -574,6 +588,20 @@
           loop:
             - kubelet
             - kubectl
+          when: node_needs_upgrade | bool
+
+        # The --pod-infra-container-image kubelet flag was removed in v1.35;
+        # a 1.35+ kubelet refuses to start if it is still present in
+        # kubeadm-flags.env. Older kubeadm wrote it at bootstrap and never
+        # strips it, and auto-removal during `kubeadm upgrade` has been
+        # unreliable (kubeadm#3281). Strip it explicitly after kubeadm has
+        # regenerated the file and before the upgraded kubelet restarts.
+        # Idempotent no-op once the flag is gone.
+        - name: Remove deprecated --pod-infra-container-image kubelet flag
+          replace:
+            path: /var/lib/kubelet/kubeadm-flags.env
+            regexp: '\s*--pod-infra-container-image=\S+'
+            replace: ''
           when: node_needs_upgrade | bool
 
         - name: Restart kubelet
