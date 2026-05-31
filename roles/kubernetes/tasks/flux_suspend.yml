@@ -1,0 +1,22 @@
+---
+# Suspend all Flux kustomizations from the control node (the workstation),
+# where the flux CLI and its kubeconfig live — NOT on the cluster nodes,
+# where flux isn't installed and the command would silently no-op. Call this
+# before draining so Flux doesn't reconcile workloads back onto nodes being
+# upgraded. No-op if the flux CLI is not present on the control node.
+- name: Check if Flux CLI is available on the control node
+  command: which flux
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  register: flux_cli_check
+  ignore_errors: true
+
+- name: Suspend Flux kustomizations
+  command: flux suspend kustomization --all
+  delegate_to: localhost
+  become: false
+  changed_when: false
+  environment:
+    KUBECONFIG: "{{ control_node_kubeconfig }}"
+  when: flux_cli_check.rc == 0

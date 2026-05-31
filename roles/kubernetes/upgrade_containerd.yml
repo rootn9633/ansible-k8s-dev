@@ -85,19 +85,8 @@
       debug:
         var: node_status.stdout_lines
 
-    - name: Check if Flux CLI is available on the control node
-      command: which flux
-      delegate_to: localhost
-      changed_when: false
-      register: flux_check
-      ignore_errors: true
-
-    - name: Suspend Flux kustomizations
-      command: flux suspend kustomization --all
-      delegate_to: localhost
-      environment:
-        KUBECONFIG: "{{ control_node_kubeconfig }}"
-      when: flux_check.rc == 0
+    - name: Suspend Flux kustomizations from the control node
+      include_tasks: tasks/flux_suspend.yml
 
 ########################################################################
 # Play 3 — Upgrade control-plane containerd (one at a time)
@@ -240,23 +229,10 @@
           become: false
           ignore_errors: true
 
-        - name: Check if Flux CLI is available on the control node (rescue)
-          command: which flux
-          delegate_to: localhost
-          become: false
-          changed_when: false
-          register: flux_check_rescue
-          ignore_errors: true
-
-        - name: Resume Flux kustomizations after failure
-          command: flux resume kustomization --all
-          delegate_to: localhost
-          become: false
-          changed_when: false
-          environment:
-            KUBECONFIG: "{{ control_node_kubeconfig }}"
-          when: flux_check_rescue.rc == 0
-          ignore_errors: true
+        - name: Resume Flux kustomizations after failure (best-effort)
+          include_tasks: tasks/flux_resume.yml
+          vars:
+            flux_besteffort: true
 
         - name: Fail with containerd upgrade error
           fail:
@@ -393,23 +369,10 @@
           changed_when: false
           when: node_needs_work | bool
 
-        # Draining force-stopped this node's Longhorn replicas; they rebuild
-        # from the healthy peer after it returns. With serial:1 and two workers,
-        # draining the next worker before this one's volumes are healthy would
-        # leave a 2-replica volume with zero healthy replicas. Gate on volume
-        # health. No-op (passes immediately) on clusters without Longhorn.
-        - name: Wait for Longhorn volumes to finish rebuilding before next node
-          shell: >-
-            kubectl -n longhorn-system get volumes.longhorn.io
-            -o jsonpath='{range .items[*]}{.status.robustness}{"\n"}{end}'
-            | grep -E 'degraded|faulted' || true
-          delegate_to: "{{ groups['kube_server'][0] }}"
-          become: false
-          changed_when: false
-          register: longhorn_unhealthy
-          until: longhorn_unhealthy.stdout | trim == ""
-          retries: 30
-          delay: 20
+        # Gate the serial loop on Longhorn volume health before releasing the
+        # next worker — see tasks/longhorn_wait.yml for the rationale.
+        - name: Gate on Longhorn volume health before next node
+          include_tasks: tasks/longhorn_wait.yml
           when: node_needs_work | bool
 
       rescue:
@@ -423,23 +386,10 @@
           become: false
           ignore_errors: true
 
-        - name: Check if Flux CLI is available on the control node (rescue)
-          command: which flux
-          delegate_to: localhost
-          become: false
-          changed_when: false
-          register: flux_check_rescue
-          ignore_errors: true
-
-        - name: Resume Flux kustomizations after failure
-          command: flux resume kustomization --all
-          delegate_to: localhost
-          become: false
-          changed_when: false
-          environment:
-            KUBECONFIG: "{{ control_node_kubeconfig }}"
-          when: flux_check_rescue.rc == 0
-          ignore_errors: true
+        - name: Resume Flux kustomizations after failure (best-effort)
+          include_tasks: tasks/flux_resume.yml
+          vars:
+            flux_besteffort: true
 
         - name: Fail with containerd upgrade error
           fail:
@@ -494,40 +444,18 @@
             var: unhealthy_pods.stdout_lines
           when: unhealthy_pods.stdout | length > 0
 
-        - name: Check if Flux CLI is available on the control node
-          command: which flux
-          delegate_to: localhost
-          changed_when: false
-          register: flux_check
-          ignore_errors: true
-
-        - name: Resume Flux kustomizations
-          command: flux resume kustomization --all
-          delegate_to: localhost
-          environment:
-            KUBECONFIG: "{{ control_node_kubeconfig }}"
-          when: flux_check.rc == 0
+        - name: Resume Flux kustomizations from the control node
+          include_tasks: tasks/flux_resume.yml
 
         - name: Containerd upgrade complete
           debug:
             msg: "Containerd upgrade completed. Verify runtime versions in the node status above."
 
       rescue:
-        - name: Check if Flux CLI is available on the control node (rescue)
-          command: which flux
-          delegate_to: localhost
-          changed_when: false
-          register: flux_check_rescue
-          ignore_errors: true
-
-        - name: Resume Flux kustomizations after post-flight failure
-          command: flux resume kustomization --all
-          delegate_to: localhost
-          environment:
-            KUBECONFIG: "{{ control_node_kubeconfig }}"
-          changed_when: false
-          when: flux_check_rescue.rc == 0
-          ignore_errors: true
+        - name: Resume Flux kustomizations after post-flight failure (best-effort)
+          include_tasks: tasks/flux_resume.yml
+          vars:
+            flux_besteffort: true
 
         - name: Fail with post-flight error
           fail:

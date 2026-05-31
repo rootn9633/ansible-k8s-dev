@@ -1,0 +1,22 @@
+---
+# Gate the serial node loop until Longhorn finishes rebuilding replicas that
+# went degraded when this node was drained (force-drain stops replicas
+# ungracefully). A node going k8s-Ready does NOT mean those rebuilds are
+# done. With serial:1 and only two workers, draining the next worker while a
+# 2-replica volume is still degraded would leave it with zero healthy
+# replicas — the one scenario that risks data loss. No-op (passes
+# immediately) on clusters without Longhorn installed.
+#
+# The caller supplies the per-node `when:` guard on the include_tasks.
+- name: Wait for Longhorn volumes to finish rebuilding before next node
+  shell: >-
+    kubectl -n longhorn-system get volumes.longhorn.io
+    -o jsonpath='{range .items[*]}{.status.robustness}{"\n"}{end}'
+    | grep -E 'degraded|faulted' || true
+  delegate_to: "{{ groups['kube_server'][0] }}"
+  become: false
+  changed_when: false
+  register: longhorn_unhealthy
+  until: longhorn_unhealthy.stdout | trim == ""
+  retries: 30
+  delay: 20
