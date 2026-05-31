@@ -151,10 +151,13 @@
           register: containerd_cfg_version
 
         - name: Determine whether this node needs the containerd upgrade
+          # A v3 config can only be produced and used by a containerd 2.x binary,
+          # so "config is already version 3" is a sufficient and reliable
+          # done-signal. We deliberately do NOT parse `containerd --version` text:
+          # its output is "containerd.io vX.Y.Z" (note the 'v' prefix), which is
+          # easy to mis-match and previously caused 2.x nodes to not skip.
           set_fact:
-            node_needs_work: >-
-              {{ (containerd_installed_version.stdout is not search('containerd.io 2\.'))
-                 or ('version = 3' not in containerd_cfg_version.stdout) }}
+            node_needs_work: "{{ 'version = 3' not in containerd_cfg_version.stdout }}"
 
         - name: Skip message
           debug:
@@ -316,10 +319,13 @@
           register: containerd_cfg_version
 
         - name: Determine whether this node needs the containerd upgrade
+          # A v3 config can only be produced and used by a containerd 2.x binary,
+          # so "config is already version 3" is a sufficient and reliable
+          # done-signal. We deliberately do NOT parse `containerd --version` text:
+          # its output is "containerd.io vX.Y.Z" (note the 'v' prefix), which is
+          # easy to mis-match and previously caused 2.x nodes to not skip.
           set_fact:
-            node_needs_work: >-
-              {{ (containerd_installed_version.stdout is not search('containerd.io 2\.'))
-                 or ('version = 3' not in containerd_cfg_version.stdout) }}
+            node_needs_work: "{{ 'version = 3' not in containerd_cfg_version.stdout }}"
 
         - name: Skip message
           debug:
