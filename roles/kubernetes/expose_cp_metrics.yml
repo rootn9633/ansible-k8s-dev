@@ -56,6 +56,42 @@
     KUBECONFIG: "{{ home_dir }}/.kube/config"
 
   tasks:
+    # Persist the static-pod bind-addresses into the kubeadm-config
+    # ClusterConfiguration so `kubeadm upgrade` regenerates the manifests
+    # WITH these values. Without this, every upgrade rewrites the manifests
+    # from kubeadm's config and reverts the manual edits above to 127.0.0.1.
+    # v1beta4 extraArgs are a list of {name, value} objects.
+    - name: Read current kubeadm ClusterConfiguration
+      command: >
+        kubectl -n kube-system get cm kubeadm-config
+        -o jsonpath={.data.ClusterConfiguration}
+      changed_when: false
+      register: kubeadm_cc
+
+    - name: Persist metrics bind-addresses into kubeadm ClusterConfiguration
+      when: >
+        'bind-address' not in kubeadm_cc.stdout or
+        'listen-metrics-urls' not in kubeadm_cc.stdout
+      shell: |
+        kubectl -n kube-system get cm kubeadm-config -o json \
+          | python3 -c "
+        import sys, json, yaml
+        cm = json.load(sys.stdin)
+        cc = yaml.safe_load(cm['data']['ClusterConfiguration'])
+        def ensure(section, name, value):
+            args = section.setdefault('extraArgs', [])
+            for a in args:
+                if a.get('name') == name:
+                    a['value'] = value
+                    return
+            args.append({'name': name, 'value': value})
+        ensure(cc.setdefault('controllerManager', {}), 'bind-address', '0.0.0.0')
+        ensure(cc.setdefault('scheduler', {}), 'bind-address', '0.0.0.0')
+        ensure(cc.setdefault('etcd', {}).setdefault('local', {}), 'listen-metrics-urls', 'http://0.0.0.0:2381')
+        cm['data']['ClusterConfiguration'] = yaml.safe_dump(cc, default_flow_style=False, sort_keys=False)
+        json.dump(cm, sys.stdout)
+        " | kubectl apply -f -
+
     - name: Check current kube-proxy metricsBindAddress
       shell: |
         kubectl get cm kube-proxy -n kube-system -o jsonpath='{.data.config\.conf}' \

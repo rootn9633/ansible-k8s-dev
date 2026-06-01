@@ -716,3 +716,54 @@
               Post-flight checks failed. The upgrade itself completed but
               verification encountered an error. Flux resume attempted.
               Run manually: kubectl get nodes && flux resume kustomization --all
+
+########################################################################
+# Play 5 — Verify control-plane metrics bind-addresses survived
+########################################################################
+# kubeadm regenerates the static-pod manifests during an upgrade. If this
+# cluster opted into metrics exposure (expose_cp_metrics.yml, which persists
+# bind-address=0.0.0.0 into the kubeadm ClusterConfiguration), confirm the
+# regenerated manifests still bind 0.0.0.0 — i.e. that kubeadm honored the
+# persisted extraArgs. Clusters that never configured this are skipped, so
+# the check never fails an upgrade it shouldn't.
+- name: Verify metrics bind-addresses survived the upgrade
+  hosts: kube_server
+  become: true
+  remote_user: debian
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Check whether metrics exposure is declared in kubeadm config
+      command: >
+        kubectl -n kube-system get cm kubeadm-config
+        -o jsonpath={.data.ClusterConfiguration}
+      delegate_to: "{{ groups['kube_server'][0] }}"
+      run_once: true
+      become: false
+      changed_when: false
+      register: kubeadm_cc
+
+    - name: Grep control-plane manifests for reverted bind-addresses
+      shell: >-
+        grep -h 'bind-address\|listen-metrics-urls'
+        /etc/kubernetes/manifests/kube-controller-manager.yaml
+        /etc/kubernetes/manifests/kube-scheduler.yaml
+        /etc/kubernetes/manifests/etcd.yaml
+        | grep '127.0.0.1' || true
+      changed_when: false
+      register: reverted_binds
+      when: "'bind-address' in kubeadm_cc.stdout"
+
+    - name: Fail if bind-addresses reverted despite being persisted in kubeadm config
+      fail:
+        msg: >-
+          Control-plane metrics bind-addresses reverted to 127.0.0.1 on
+          {{ inventory_hostname }} even though kubeadm config declares 0.0.0.0:
+          {{ reverted_binds.stdout_lines }}.
+          A kubeadm version may have stopped honoring these extraArgs — Prometheus
+          scrapes of controller-manager/scheduler/etcd will be down.
+          Re-run: ansible-playbook -i dev_hosts.yml roles/kubernetes/expose_cp_metrics.yml
+      when:
+        - "'bind-address' in kubeadm_cc.stdout"
+        - reverted_binds.stdout | default('') | trim != ""
