@@ -1,0 +1,111 @@
+---
+# Idempotent root-disk grower. Run this after enlarging a node's virtual disk
+# at the hypervisor (e.g. bumping the Proxmox disk size). It reclaims the new
+# space into the root partition and filesystem ONLINE — no drain, no reboot.
+#
+# Safe to run against the whole fleet no matter which nodes you actually grew:
+# every step is a no-op where there's nothing to do (growpart reports NOCHANGE,
+# resize2fs reports "Nothing to do"). Re-running changes nothing.
+#
+# Usage:
+#   ansible-playbook -i dev_hosts.yml roles/kubernetes/grow_node_disk.yml
+#   # one node only:
+#   ansible-playbook -i dev_hosts.yml roles/kubernetes/grow_node_disk.yml --limit 192.168.3.32
+#
+# Scope: grows the partition backing "/" (override with grow_mount). Assumes a
+# single growable partition on a GPT/MBR disk (the standard Debian cloud-image
+# layout where the root partition is physically last). LVM is not handled —
+# these nodes use a plain partition (see lsblk), so it isn't needed.
+
+- name: Grow root partition and filesystem to fill the disk
+  hosts: all
+  become: true
+  remote_user: debian
+  vars:
+    grow_mount: "/"
+
+  tasks:
+    - name: Ensure growpart is available (provided by cloud-guest-utils)
+      ansible.builtin.apt:
+        name: cloud-guest-utils
+        state: present
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Resolve the device backing {{ grow_mount }}
+      ansible.builtin.set_fact:
+        root_part_dev: "{{ (ansible_mounts | selectattr('mount', 'equalto', grow_mount) | first).device }}"
+        root_fstype: "{{ (ansible_mounts | selectattr('mount', 'equalto', grow_mount) | first).fstype }}"
+
+    - name: Fail if the root device is not a plain block partition
+      ansible.builtin.fail:
+        msg: >-
+          {{ grow_mount }} is backed by {{ root_part_dev }}, which this playbook
+          does not know how to grow (expected a /dev/* partition; LVM/mapper not
+          supported here).
+      when: not root_part_dev.startswith('/dev/')
+
+    - name: Identify the parent disk of the root partition
+      ansible.builtin.command: "lsblk -ndo pkname {{ root_part_dev }}"
+      changed_when: false
+      register: parent_disk
+
+    - name: Read the root partition number
+      ansible.builtin.slurp:
+        src: "/sys/class/block/{{ root_part_dev | basename }}/partition"
+      register: part_num_raw
+
+    - name: Set disk and partition-number facts
+      ansible.builtin.set_fact:
+        root_disk: "/dev/{{ parent_disk.stdout | trim }}"
+        root_part_num: "{{ (part_num_raw.content | b64decode) | trim }}"
+
+    - name: Show what will be grown
+      ansible.builtin.debug:
+        msg: >-
+          {{ grow_mount }} -> {{ root_part_dev }} ({{ root_fstype }}) on disk
+          {{ root_disk }} partition {{ root_part_num }}
+
+    # growpart exit codes: 0 = resized, 1 = NOCHANGE (already fills the disk),
+    # 2 = error. Treat 0/1 as success so re-runs are clean; only 2 fails.
+    - name: Grow the partition to fill the disk (idempotent)
+      ansible.builtin.command: "growpart {{ root_disk }} {{ root_part_num }}"
+      register: growpart_result
+      changed_when: growpart_result.rc == 0
+      failed_when: growpart_result.rc not in [0, 1]
+
+    - name: Show growpart result
+      ansible.builtin.debug:
+        var: growpart_result.stdout_lines
+      when: growpart_result.stdout | default('') | trim != ''
+
+    # Online filesystem grow. resize2fs/xfs_growfs are themselves idempotent
+    # (they no-op when the fs already fills the partition), so this runs every
+    # time and self-heals a partition that was grown but never resized.
+    - name: Grow the ext filesystem online (idempotent)
+      ansible.builtin.command: "resize2fs {{ root_part_dev }}"
+      register: resize2fs_result
+      changed_when: "'Nothing to do' not in (resize2fs_result.stderr + resize2fs_result.stdout)"
+      when: root_fstype in ['ext2', 'ext3', 'ext4']
+
+    - name: Grow the XFS filesystem online (idempotent)
+      ansible.builtin.command: "xfs_growfs {{ grow_mount }}"
+      register: xfs_growfs_result
+      changed_when: "'data size unchanged' not in (xfs_growfs_result.stderr + xfs_growfs_result.stdout)"
+      when: root_fstype == 'xfs'
+
+    - name: Fail on an unsupported root filesystem
+      ansible.builtin.fail:
+        msg: >-
+          {{ grow_mount }} is {{ root_fstype }}; only ext2/3/4 and xfs are
+          handled. Grow it manually.
+      when: root_fstype not in ['ext2', 'ext3', 'ext4', 'xfs']
+
+    - name: Report resulting free space on {{ grow_mount }}
+      ansible.builtin.command: "df -h {{ grow_mount }}"
+      changed_when: false
+      register: df_after
+
+    - name: Show free space
+      ansible.builtin.debug:
+        var: df_after.stdout_lines
