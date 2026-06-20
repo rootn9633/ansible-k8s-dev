@@ -1,0 +1,242 @@
+---
+# Per-node Debian major-release upgrade (e.g. bullseye -> bookworm), included
+# once per node by upgrade_debian_release.yml inside a serial:1 block/rescue.
+# Idempotent: a node already on {{ target_release }} is detected and skipped, so
+# the playbook is safely resumable after a partial run.
+#
+# Caller (the play) supplies:
+#   _drain_disable_eviction : bool  — workers force-drain (PDB-safe), CPs don't
+#   _gate_longhorn          : bool  — gate the serial loop on Longhorn health
+# And the playbook-level vars: target_release, target_release_major,
+# min_free_mb, cuda_distro_from, cuda_distro_to.
+
+- name: Decide whether this node needs the release upgrade
+  ansible.builtin.set_fact:
+    release_upgrade_needed: "{{ ansible_distribution_release != target_release }}"
+
+- name: Skip — already on target release
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }} is already {{ ansible_distribution_release }} — nothing to do."
+  when: not release_upgrade_needed | bool
+
+- name: Upgrade this node to {{ target_release }}
+  when: release_upgrade_needed | bool
+  block:
+    - name: Resolve Kubernetes node name for this host
+      ansible.builtin.shell: >
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name} {.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+        | awk '$2 == "{{ ansible_default_ipv4.address | default(inventory_hostname) }}" { print $1 }'
+      delegate_to: "{{ groups['kube_server'][0] }}"
+      become: false
+      changed_when: false
+      register: k8s_node_name_result
+
+    - name: Fail if Kubernetes node name could not be resolved
+      ansible.builtin.fail:
+        msg: >-
+          Could not resolve Kubernetes node name for {{ inventory_hostname }}.
+          Check: kubectl get nodes -o wide
+      when: k8s_node_name_result.stdout | trim == ""
+
+    - name: Set k8s_node_name fact
+      ansible.builtin.set_fact:
+        k8s_node_name: "{{ k8s_node_name_result.stdout | trim }}"
+
+    # ---- Disk preflight (fail fast, before we drain anything) -------------
+    - name: Free up apt cache before measuring space
+      ansible.builtin.apt:
+        autoclean: yes
+
+    - name: Measure available space on /
+      ansible.builtin.shell: "df -BM --output=avail / | tail -1 | tr -dc '0-9'"
+      changed_when: false
+      register: avail_mb
+
+    - name: Fail if there is not enough free space for the upgrade
+      ansible.builtin.fail:
+        msg: >-
+          Only {{ avail_mb.stdout }}MB free on / — need at least {{ min_free_mb }}MB
+          for the {{ target_release }} upgrade. Grow the disk
+          (roles/kubernetes/grow_node_disk.yml) or free space, then re-run.
+      when: avail_mb.stdout | int < (min_free_mb | int)
+
+    # ---- Rewrite apt sources to the target release -----------------------
+    - name: Rewrite Debian codename in /etc/apt/sources.list
+      ansible.builtin.replace:
+        path: /etc/apt/sources.list
+        regexp: '\b{{ ansible_distribution_release }}\b'
+        replace: "{{ target_release }}"
+        backup: yes
+
+    - name: Find apt source files in sources.list.d
+      ansible.builtin.find:
+        paths: /etc/apt/sources.list.d
+        patterns: "*.list"
+      register: apt_list_files
+
+    # Docker's repo is codename-suffixed (…/debian bullseye stable) and gets
+    # rewritten here. The Kubernetes (pkgs.k8s.io, flat "/ /") and
+    # libnvidia-container ($(ARCH), flat) repos carry no codename token, so the
+    # word-boundary match leaves them untouched.
+    - name: Rewrite Debian codename in sources.list.d files
+      ansible.builtin.replace:
+        path: "{{ item.path }}"
+        regexp: '\b{{ ansible_distribution_release }}\b'
+        replace: "{{ target_release }}"
+        backup: yes
+      loop: "{{ apt_list_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # The NVIDIA CUDA repo is keyed by a distro slug (…/repos/debian11/…), not
+    # the Debian codename, so it needs its own rewrite. No-op on non-GPU nodes
+    # (no file contains the slug).
+    - name: Rewrite NVIDIA CUDA repo distro slug (GPU node)
+      ansible.builtin.replace:
+        path: "{{ item.path }}"
+        regexp: "{{ cuda_distro_from }}"
+        replace: "{{ cuda_distro_to }}"
+        backup: yes
+      loop: "{{ apt_list_files.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    # A major-release bump changes the repos' Suite/Codename/Label, which
+    # apt-get update refuses non-interactively unless told the change is
+    # expected. The apt module can't pass this flag, so use the command form.
+    - name: Update apt cache against the new release
+      ansible.builtin.command: apt-get update --allow-releaseinfo-change
+      changed_when: false
+
+    # Keep the container runtime pinned across the release jump — owned by the
+    # separate upgrade_containerd.yml track. Idempotent; mirrors upgrade_os.yml.
+    - name: Hold container runtime packages (managed by upgrade_containerd.yml)
+      ansible.builtin.dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - containerd.io
+        - cri-tools
+        - kubernetes-cni
+
+    # ---- Drain, then upgrade --------------------------------------------
+    - name: Drain node
+      ansible.builtin.command: >-
+        kubectl drain {{ k8s_node_name }} --ignore-daemonsets --delete-emptydir-data
+        {{ '--disable-eviction' if _drain_disable_eviction | bool else '' }} --timeout=300s
+      delegate_to: "{{ groups['kube_server'][0] }}"
+      become: false
+      register: drain_result
+      until: drain_result.rc == 0
+      retries: 3
+      delay: 30
+
+    # Debian's documented two-step path: a minimal upgrade first
+    # (--without-new-pkgs) to move the core system, then a full-upgrade. Both run
+    # non-interactively and keep existing conffiles so the run never blocks on a
+    # dpkg prompt.
+    - name: Minimal upgrade (apt-get upgrade --without-new-pkgs)
+      ansible.builtin.command: >-
+        apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+        upgrade --without-new-pkgs
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: minimal_upgrade
+      changed_when: "'0 upgraded, 0 newly installed, 0 to remove' not in minimal_upgrade.stdout"
+
+    - name: Full upgrade (apt-get full-upgrade)
+      ansible.builtin.command: >-
+        apt-get -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+        full-upgrade
+      environment:
+        DEBIAN_FRONTEND: noninteractive
+      register: full_upgrade
+      changed_when: "'0 upgraded, 0 newly installed, 0 to remove' not in full_upgrade.stdout"
+
+    - name: Remove now-unused packages
+      ansible.builtin.apt:
+        autoremove: yes
+        purge: yes
+
+    - name: Clean apt package cache
+      ansible.builtin.command: apt-get clean
+      changed_when: false
+
+    - name: Reboot into the new kernel
+      ansible.builtin.reboot:
+        msg: "Debian {{ target_release }} upgrade reboot"
+        reboot_timeout: "{{ reboot_timeout | default(600) }}"
+
+    - name: Refresh facts after reboot (distribution, kernel)
+      ansible.builtin.setup:
+        filter:
+          - "ansible_distribution*"
+          - "ansible_kernel"
+
+    - name: Verify the node is now on the target release
+      ansible.builtin.fail:
+        msg: >-
+          {{ inventory_hostname }} reports {{ ansible_distribution_release }}
+          ({{ ansible_distribution_version }}) after upgrade, expected {{ target_release }}
+          ({{ target_release_major }}.x). Investigate before continuing.
+      when: ansible_distribution_release != target_release
+
+    - name: Wait for kubelet to be active
+      ansible.builtin.command: systemctl is-active kubelet
+      register: kubelet_status
+      until: kubelet_status.rc == 0
+      retries: 30
+      delay: 10
+      changed_when: false
+
+    - name: Wait for API server to be ready
+      ansible.builtin.command: kubectl get --raw /readyz
+      delegate_to: "{{ groups['kube_server'][0] }}"
+      become: false
+      changed_when: false
+      register: api_ready
+      until: api_ready.rc == 0
+      retries: 30
+      delay: 10
+
+    - name: Uncordon node
+      ansible.builtin.command: "kubectl uncordon {{ k8s_node_name }}"
+      delegate_to: "{{ groups['kube_server'][0] }}"
+      become: false
+      register: uncordon_result
+      until: uncordon_result.rc == 0
+      retries: 6
+      delay: 10
+
+    - name: Wait for node to become Ready
+      ansible.builtin.command: "kubectl wait --for=condition=Ready node/{{ k8s_node_name }} --timeout=300s"
+      delegate_to: "{{ groups['kube_server'][0] }}"
+      become: false
+      changed_when: false
+
+    # ---- GPU node: ensure the DKMS driver rebuilt against the new kernel --
+    - name: GPU node — verify NVIDIA driver after the release upgrade
+      when: inventory_hostname in groups.get('gpu_nodes', [])
+      block:
+        - name: Install headers for the new kernel + DKMS build tooling
+          ansible.builtin.apt:
+            name:
+              - "linux-headers-{{ ansible_kernel }}"
+              - linux-headers-amd64
+              - dkms
+              - build-essential
+            state: present
+            update_cache: yes
+
+        - name: Ensure DKMS modules are built for the running kernel
+          ansible.builtin.command: dkms autoinstall
+          register: dkms_autoinstall
+          changed_when: "'Module' in dkms_autoinstall.stdout"
+
+        - name: Verify the NVIDIA driver and runtime (tasks/gpu_verify.yml)
+          ansible.builtin.include_tasks: gpu_verify.yml
+
+    # ---- Gate the serial loop on storage health before the next node -----
+    - name: Gate on Longhorn volume health before next node
+      ansible.builtin.include_tasks: longhorn_wait.yml
+      when: _gate_longhorn | bool

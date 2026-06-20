@@ -1,0 +1,271 @@
+---
+# Rolling Debian MAJOR-release upgrade (bullseye -> bookworm) for the cluster.
+#
+# This is the one-time release-migration counterpart to upgrade_os.yml (which
+# only does in-release apt upgrades). It rewrites apt sources to the new
+# codename and performs Debian's two-step minimal-then-full upgrade, one node at
+# a time, draining workloads first — reusing the same kubeconfig-HA, Flux
+# suspend/resume, Longhorn-gating and rescue machinery as upgrade_os.yml.
+#
+# Per-node work lives in tasks/debian_release_upgrade_node.yml. It is idempotent
+# and resumable: nodes already on the target release are skipped.
+#
+# Usage:
+#   ansible-playbook -i dev_hosts.yml roles/kubernetes/upgrade_debian_release.yml
+#
+# Optional overrides (defaults target bookworm):
+#   target_release=bookworm target_release_major=12 min_free_mb=4096
+
+########################################################################
+# Play 1 — Ensure control-plane kubeconfig is current and HA
+########################################################################
+# Identical to upgrade_os.yml Play 1: kubeadm cert renewal can leave the debian
+# user's ~/.kube/config stale; refresh it (pointed at the keepalived VIP) on
+# every CP node so the rescue path that delegates to a peer also has a working
+# kubeconfig.
+- name: Ensure control-plane kubeconfig is current and HA
+  hosts: kube_server
+  become: true
+  remote_user: debian
+  any_errors_fatal: true
+
+  tasks:
+    - name: Ensure .kube directory exists
+      ansible.builtin.file:
+        path: "{{ home_dir }}/.kube"
+        state: directory
+        owner: debian
+        group: debian
+        mode: "0700"
+
+    - name: Read cluster admin.conf
+      ansible.builtin.slurp:
+        src: /etc/kubernetes/admin.conf
+      register: admin_conf
+
+    - name: Render kubeconfig pointed at the control-plane VIP
+      ansible.builtin.copy:
+        content: "{{ admin_conf.content | b64decode | regex_replace('server: https?://.*', 'server: https://' ~ control_vip ~ ':' ~ haproxy_port) }}"
+        dest: "{{ home_dir }}/.kube/config"
+        owner: debian
+        group: debian
+        mode: "0600"
+
+########################################################################
+# Play 2 — Pre-flight checks
+########################################################################
+- name: Debian release upgrade pre-flight checks
+  hosts: kube_server[0]
+  become: false
+  remote_user: debian
+  any_errors_fatal: true
+  vars: &upgrade_vars
+    target_release: bookworm
+    target_release_major: "12"
+    min_free_mb: 4096
+    cuda_distro_from: debian11
+    cuda_distro_to: debian12
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Verify all nodes are Ready
+      ansible.builtin.shell: kubectl get nodes --no-headers | grep -v ' Ready' || true
+      changed_when: false
+      register: not_ready_nodes
+
+    - name: Fail if any nodes are not Ready
+      ansible.builtin.fail:
+        msg: >-
+          Some nodes are not Ready. Resolve before the release upgrade:
+          {{ not_ready_nodes.stdout }}
+      when: not_ready_nodes.stdout | trim != ""
+
+    - name: Display current node status
+      ansible.builtin.command: kubectl get nodes -o wide
+      changed_when: false
+      register: node_status
+
+    - name: Show node status
+      ansible.builtin.debug:
+        var: node_status.stdout_lines
+
+    - name: Suspend Flux kustomizations from the control node
+      ansible.builtin.include_tasks: tasks/flux_suspend.yml
+
+########################################################################
+# Play 3 — Upgrade control plane nodes (one at a time)
+########################################################################
+- name: Debian release upgrade — control plane nodes
+  hosts: kube_server
+  serial: 1
+  become: true
+  remote_user: debian
+  any_errors_fatal: true
+  vars:
+    <<: *upgrade_vars
+    _drain_disable_eviction: false
+    _gate_longhorn: false
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Upgrade control plane node
+      block:
+        - name: Run per-node release upgrade
+          ansible.builtin.include_tasks: tasks/debian_release_upgrade_node.yml
+
+      rescue:
+        - name: Pick a healthy CP for rescue commands
+          ansible.builtin.set_fact:
+            rescue_delegate: >-
+              {{ groups['kube_server'] | reject('equalto', inventory_hostname) | list
+                 | first | default(inventory_hostname) }}
+
+        - name: Attempt to uncordon node after failure
+          ansible.builtin.command: "kubectl uncordon {{ k8s_node_name | default(inventory_hostname) }}"
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          ignore_errors: true
+
+        - name: Resume Flux kustomizations after failure (best-effort)
+          ansible.builtin.include_tasks: tasks/flux_resume.yml
+          vars:
+            flux_besteffort: true
+
+        - name: Fail with release upgrade error
+          ansible.builtin.fail:
+            msg: >-
+              Debian release upgrade failed on {{ inventory_hostname }}
+              (k8s node: {{ k8s_node_name | default('unknown') }}).
+              Best-effort uncordon and Flux resume attempted (via {{ rescue_delegate }}).
+              Verify node state with: kubectl get nodes
+              Investigate and re-run (the playbook is resumable).
+
+########################################################################
+# Play 4 — Upgrade worker nodes (one at a time)
+########################################################################
+# kube_agents order puts the GPU node (.42) last, so the riskier node upgrades
+# only after the plain worker has proven the path.
+- name: Debian release upgrade — worker nodes
+  hosts: kube_agents
+  serial: 1
+  become: true
+  remote_user: debian
+  any_errors_fatal: true
+  vars:
+    <<: *upgrade_vars
+    _drain_disable_eviction: true
+    _gate_longhorn: true
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Upgrade worker node
+      block:
+        - name: Run per-node release upgrade
+          ansible.builtin.include_tasks: tasks/debian_release_upgrade_node.yml
+
+      rescue:
+        - name: Pick a healthy CP for rescue commands
+          ansible.builtin.set_fact:
+            rescue_delegate: "{{ groups['kube_server'][0] }}"
+
+        - name: Attempt to uncordon worker after failure
+          ansible.builtin.command: "kubectl uncordon {{ k8s_node_name | default(inventory_hostname) }}"
+          delegate_to: "{{ rescue_delegate }}"
+          become: false
+          ignore_errors: true
+
+        - name: Resume Flux kustomizations after failure (best-effort)
+          ansible.builtin.include_tasks: tasks/flux_resume.yml
+          vars:
+            flux_besteffort: true
+
+        - name: Fail with release upgrade error
+          ansible.builtin.fail:
+            msg: >-
+              Debian release upgrade failed on {{ inventory_hostname }}
+              (k8s node: {{ k8s_node_name | default('unknown') }}).
+              Best-effort uncordon and Flux resume attempted (via {{ rescue_delegate }}).
+              Verify node state with: kubectl get nodes
+              Investigate and re-run (the playbook is resumable).
+
+########################################################################
+# Play 5 — Post-flight checks
+########################################################################
+- name: Debian release upgrade post-flight checks
+  hosts: kube_server[0]
+  become: false
+  remote_user: debian
+  vars: *upgrade_vars
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Post-flight
+      block:
+        - name: Verify all nodes are Ready
+          ansible.builtin.command: kubectl get nodes -o wide
+          changed_when: false
+          register: final_node_status
+
+        - name: Display final node status
+          ansible.builtin.debug:
+            var: final_node_status.stdout_lines
+
+        - name: Check for NotReady nodes
+          ansible.builtin.shell: kubectl get nodes --no-headers | grep -v ' Ready' || true
+          changed_when: false
+          register: not_ready_post
+
+        - name: Fail if any nodes are not Ready after upgrade
+          ansible.builtin.fail:
+            msg: >-
+              Some nodes are not Ready after the release upgrade:
+              {{ not_ready_post.stdout }}
+          when: not_ready_post.stdout | trim != ""
+
+        - name: Report Debian version on every node
+          ansible.builtin.command: cat /etc/debian_version
+          changed_when: false
+          register: debver
+          delegate_to: "{{ item }}"
+          loop: "{{ groups['all'] }}"
+
+        - name: Show Debian versions
+          ansible.builtin.debug:
+            msg: "{{ item.item }} -> {{ item.stdout }}"
+          loop: "{{ debver.results }}"
+          loop_control:
+            label: "{{ item.item }}"
+
+        - name: Check for unhealthy pods
+          ansible.builtin.shell: kubectl get pods -A --no-headers | grep -v Running | grep -v Completed || true
+          changed_when: false
+          register: unhealthy_pods
+
+        - name: Display unhealthy pods
+          ansible.builtin.debug:
+            var: unhealthy_pods.stdout_lines
+          when: unhealthy_pods.stdout | length > 0
+
+        - name: Resume Flux kustomizations from the control node
+          ansible.builtin.include_tasks: tasks/flux_resume.yml
+
+        - name: Release upgrade complete
+          ansible.builtin.debug:
+            msg: "Rolling Debian {{ target_release }} upgrade completed on all nodes."
+
+      rescue:
+        - name: Resume Flux kustomizations after post-flight failure (best-effort)
+          ansible.builtin.include_tasks: tasks/flux_resume.yml
+          vars:
+            flux_besteffort: true
+
+        - name: Fail with post-flight error
+          ansible.builtin.fail:
+            msg: >-
+              Post-flight checks failed. The release upgrade itself may have
+              completed but verification errored. Flux resume attempted.
+              Run manually: kubectl get nodes && flux resume kustomization --all
