@@ -1,0 +1,45 @@
+---
+# Variables for the NVIDIA GPU worker(s). Consumed by
+# roles/kubernetes/gpu_node.yml and its tasks/gpu_*.yml steps.
+
+# NVIDIA driver branch — selects the cuda-drivers-<branch> metapackage from
+# NVIDIA's CUDA repo, installed via DKMS so the module auto-rebuilds on kernel
+# upgrades. NOTE: that meta depends on `nvidia-driver` *unversioned*, and the
+# debian11 repo ships several branches (550/555/560) at once, so apt installs
+# the newest nvidia-driver available — the branch number does NOT strictly pin
+# the driver version. The actual version is frozen afterwards by the apt-mark
+# hold in tasks/gpu_driver.yml (currently 560.35.05 on the existing node). For
+# deterministic *fresh* installs, set nvidia_driver_version below.
+nvidia_driver_branch: "550"
+
+# Optional exact driver version (e.g. "560.35.05-1"). When set, gpu_driver.yml
+# installs nvidia-driver pinned to it instead of letting apt pick the newest in
+# the branch — making fresh GPU-node installs reproducible. Empty = newest.
+nvidia_driver_version: ""
+
+# NVIDIA CUDA apt repo distro slug. The cluster runs Debian 11 (Bullseye).
+# If/when the GPU node is upgraded to Bookworm, change this to "debian12".
+nvidia_cuda_repo_distro: "debian11"
+
+# Pin a specific nvidia-container-toolkit version once you've confirmed one
+# (e.g. "1.16.2-1"); empty installs the current latest, which is then held.
+nvidia_container_toolkit_version: ""
+
+# Path to the containerd config. Kept in sync with the dest used by the
+# shared tasks/containerd_config.yml (which owns the actual write).
+containerd_config_path: /etc/containerd/config.toml
+
+# Node label the Flux nvidia-device-plugin nodeSelector expects.
+gpu_node_label: "gpu=true"
+
+# Cordon + drain (Longhorn-aware) around the disruptive driver reboot /
+# containerd restart. Leave on for a node hosting real workloads
+# (Plex/Frigate/Ollama).
+gpu_node_drain: true
+
+# Optionally run a throwaway CUDA container via ctr during verify to prove the
+# runtime end to end. Off by default (it pulls an image).
+gpu_run_test_container: false
+gpu_test_image: "docker.io/nvidia/cuda:12.4.1-base-ubuntu22.04"
+
+reboot_timeout: 600

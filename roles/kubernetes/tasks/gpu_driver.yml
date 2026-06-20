@@ -1,0 +1,70 @@
+---
+# Install the NVIDIA proprietary driver via DKMS from NVIDIA's CUDA apt repo,
+# so the kernel module auto-rebuilds on every kernel upgrade — the single most
+# important durability property for an unattended GPU worker. The driver is
+# pinned to a branch and apt-mark held so unattended-upgrades can't pull a
+# driver newer than the CUDA/container stack expects. A driver install/change
+# flags gpu_reboot_required so the module loads cleanly on a fresh boot.
+
+# NVIDIA's cuda-drivers meta depends on Debian-maintained helper packages
+# (glx-alternative-nvidia in contrib, nvidia-alternative in non-free). A stock
+# Debian sources.list ships only `main`, so the install fails with "held broken
+# packages / glx-alternative-nvidia is not installable". Enable contrib +
+# non-free on the base suites in place (idempotent: the contrib lookahead means
+# already-converted lines don't match). Codename comes from facts so this is
+# correct on bullseye now and bookworm after an OS upgrade.
+- name: Enable contrib + non-free components (required by cuda-drivers on Debian)
+  ansible.builtin.replace:
+    path: /etc/apt/sources.list
+    regexp: '^(deb(?:-src)?\s+\S+\s+{{ ansible_distribution_release }}(?:-updates|-security)?\s+main)((?!.*contrib).*)$'
+    replace: '\1 contrib non-free\2'
+  register: deb_components
+
+- name: Install the CUDA repo keyring package (adds repo + signed-by key)
+  ansible.builtin.apt:
+    deb: "https://developer.download.nvidia.com/compute/cuda/repos/{{ nvidia_cuda_repo_distro }}/x86_64/cuda-keyring_1.1-1_all.deb"
+  register: cuda_keyring
+
+- name: Install kernel headers and DKMS build tooling for the running kernel
+  ansible.builtin.apt:
+    name:
+      - "linux-headers-{{ ansible_kernel }}"
+      - linux-headers-amd64
+      - dkms
+      - build-essential
+    state: present
+    update_cache: yes
+
+# With nvidia_driver_version set, pin nvidia-driver to that exact version
+# (deterministic, reproducible on fresh nodes). Otherwise install the
+# cuda-drivers-<branch> meta, whose unversioned nvidia-driver dep resolves to
+# the newest version in NVIDIA's repo (then frozen by the hold below).
+- name: Install the NVIDIA DKMS driver
+  ansible.builtin.apt:
+    name: "{{ ('nvidia-driver=' + nvidia_driver_version) if nvidia_driver_version else ('cuda-drivers-' + nvidia_driver_branch) }}"
+    state: present
+    allow_downgrade: "{{ (nvidia_driver_version | length) > 0 }}"
+  register: nvidia_driver_install
+
+# Filter to genuinely-installed packages (Status-Abbrev 2nd char 'i'): the glob
+# also matches virtual packages/provides (status 'un'), which can't be held and
+# would make dpkg_selections report "changed" on every run.
+- name: Find installed NVIDIA driver / CUDA packages
+  ansible.builtin.shell: >-
+    dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n'
+    'cuda-drivers*' 'nvidia-kernel*' 'nvidia-driver*' 'nvidia-dkms*'
+    'nvidia-compute*' 'libnvidia-*' 2>/dev/null
+    | awk '$1 ~ /^.i/ {print $2}' || true
+  changed_when: false
+  register: nvidia_driver_pkgs
+
+- name: Hold the NVIDIA driver / CUDA packages against unattended upgrades
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: "{{ nvidia_driver_pkgs.stdout_lines | select | list }}"
+
+- name: Flag that a reboot is required (driver install/change)
+  ansible.builtin.set_fact:
+    gpu_reboot_required: true
+  when: nvidia_driver_install is changed

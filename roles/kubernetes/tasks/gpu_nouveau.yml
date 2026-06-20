@@ -1,0 +1,26 @@
+---
+# Blacklist the open-source nouveau driver so it can't claim the GPU before
+# the NVIDIA module loads. A change requires regenerating the initramfs and a
+# reboot — we only *flag* the reboot here (gpu_reboot_required) so it shares
+# the single reboot performed after the driver install. No spurious reboot on
+# a re-run: the copy is idempotent and only a content change flags the reboot.
+
+- name: Blacklist the nouveau driver
+  ansible.builtin.copy:
+    dest: /etc/modprobe.d/blacklist-nouveau.conf
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      blacklist nouveau
+      options nouveau modeset=0
+  register: nouveau_blacklist
+
+- name: Regenerate the initramfs after blacklisting nouveau
+  ansible.builtin.command: update-initramfs -u
+  when: nouveau_blacklist is changed
+
+- name: Flag that a reboot is required (nouveau change)
+  ansible.builtin.set_fact:
+    gpu_reboot_required: true
+  when: nouveau_blacklist is changed

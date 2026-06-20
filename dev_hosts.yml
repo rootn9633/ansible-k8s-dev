@@ -11,3 +11,10 @@ all:
       hosts:
         192.168.3.41:
         192.168.3.42:
+    # Worker(s) with an NVIDIA GPU passed through by Proxmox. This overlays
+    # kube_agents (a host may belong to both groups). Targeted by
+    # roles/kubernetes/gpu_node.yml only — never the whole fleet. Adjust the
+    # IP to the worker that actually has the GPU.
+    gpu_nodes:
+      hosts:
+        192.168.3.42:

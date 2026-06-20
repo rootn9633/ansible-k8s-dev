@@ -1,0 +1,36 @@
+---
+# Pre-flight gate for GPU enablement. Refuses to touch a node unless it is a
+# designated GPU node AND an NVIDIA GPU is actually visible on the PCI bus.
+# A missing GPU means the Proxmox PCI passthrough (Phase 1) isn't done — fail
+# loudly here rather than installing drivers against nothing.
+
+- name: Assert this host is a designated GPU node
+  ansible.builtin.assert:
+    that:
+      - groups['gpu_nodes'] is defined
+      - inventory_hostname in groups['gpu_nodes']
+    fail_msg: "gpu_node.yml must run only against the gpu_nodes inventory group."
+    success_msg: "{{ inventory_hostname }} is a designated GPU node."
+
+- name: Ensure pciutils is installed (provides lspci)
+  ansible.builtin.apt:
+    name: pciutils
+    state: present
+    update_cache: yes
+
+- name: Detect an NVIDIA GPU on the PCI bus
+  ansible.builtin.shell: "lspci -nn | grep -i nvidia || true"
+  changed_when: false
+  register: lspci_nvidia
+
+- name: Fail clearly if no NVIDIA GPU is visible
+  ansible.builtin.fail:
+    msg: >-
+      No NVIDIA GPU visible via lspci on {{ inventory_hostname }}. The Proxmox
+      PCI passthrough is not complete — aborting before installing drivers.
+      Complete passthrough (Phase 1) and re-run.
+  when: lspci_nvidia.stdout | trim == ""
+
+- name: Show detected GPU
+  ansible.builtin.debug:
+    var: lspci_nvidia.stdout_lines

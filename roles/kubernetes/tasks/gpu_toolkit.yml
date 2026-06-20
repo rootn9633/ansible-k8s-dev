@@ -1,0 +1,54 @@
+---
+# Install the NVIDIA Container Toolkit from the libnvidia-container repo and
+# hold it, keeping the container stack pinned alongside the driver. The toolkit
+# provides nvidia-ctk, which tasks/containerd_config.yml uses to register the
+# nvidia containerd runtime. No reboot/restart here — the containerd wiring and
+# any restart are owned centrally by tasks/containerd_config.yml.
+
+- name: Ensure tooling for repo setup is present (curl, gnupg)
+  ansible.builtin.apt:
+    name:
+      - curl
+      - gnupg
+    state: present
+    update_cache: yes
+
+# Mirror NVIDIA's official setup exactly (fetch + sed the upstream .list) so
+# the repo line — including the $(ARCH) token apt expands — is always correct.
+# `creates:` makes it idempotent: it runs once, then never again.
+- name: Add the NVIDIA Container Toolkit apt repo and key
+  ansible.builtin.shell: |
+    set -o pipefail
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+      | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+    curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+      | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+      > /etc/apt/sources.list.d/nvidia-container-toolkit.list
+  args:
+    executable: /bin/bash
+    creates: /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+- name: Install the NVIDIA Container Toolkit
+  ansible.builtin.apt:
+    name: "nvidia-container-toolkit{{ ('=' + nvidia_container_toolkit_version) if nvidia_container_toolkit_version else '' }}"
+    state: present
+    update_cache: yes
+    allow_downgrade: yes
+  register: toolkit_install
+
+# Filter to genuinely-installed packages (Status-Abbrev 2nd char 'i'); the glob
+# also matches virtual provides (e.g. nvidia-container-runtime, status 'un')
+# that can't be held and would make dpkg_selections report "changed" each run.
+- name: Find installed NVIDIA Container Toolkit packages
+  ansible.builtin.shell: >-
+    dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n'
+    'nvidia-container*' 'libnvidia-container*' 2>/dev/null
+    | awk '$1 ~ /^.i/ {print $2}' || true
+  changed_when: false
+  register: toolkit_pkgs
+
+- name: Hold the NVIDIA Container Toolkit packages against unattended upgrades
+  ansible.builtin.dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: "{{ toolkit_pkgs.stdout_lines | select | list }}"

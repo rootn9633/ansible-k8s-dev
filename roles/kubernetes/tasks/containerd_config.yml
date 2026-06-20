@@ -7,14 +7,37 @@
 # a major containerd upgrade. It flips the default `SystemdCgroup = false` to
 # `true` by value (not by section anchor), so it works regardless of schema.
 #
-# Included by install_kubernetes_dependencies.yml (initial provisioning) and
-# upgrade_containerd.yml (runtime upgrade). The previous config is backed up by
-# the copy module; containerd is restarted only when the rendered config
-# actually changes, then verified active.
+# GPU nodes: the nvidia containerd runtime is wired in here too, but NOT inside
+# config.toml. nvidia-ctk (>= 1.16) writes the runtime to a *drop-in*
+# (/etc/containerd/conf.d/99-nvidia.toml) and relies on the main config's
+# `imports` glob to load it (containerd's own `config default` already emits
+# that glob; we add it defensively if a build omits it). This split is what we
+# want: config.toml stays a deterministic function of the containerd binary
+# (so this task can regenerate it across a major upgrade without churn), while
+# the nvidia runtime lives in a separate file that the regeneration never
+# touches. nvidia-ctk reads the installed binary's schema, so the drop-in is
+# correct across the config v2 -> v3 (containerd 1.x -> 2.x) transition. We
+# point nvidia-ctk's --config at a throwaway copy so it can't reformat the real
+# config.toml (which would defeat idempotency); the drop-in path is absolute,
+# so it still lands in /etc/containerd/conf.d regardless.
+#
+# Included by install_kubernetes_dependencies.yml (initial provisioning),
+# upgrade_containerd.yml (runtime upgrade) and gpu_node.yml (GPU enablement).
+# The previous config is backed up by the copy module; containerd is restarted
+# only when config.toml or the nvidia drop-in actually changes — and never when
+# a reboot is already queued (gpu_reboot_required), since the reboot restarts it.
 
 - name: Ensure /etc/containerd exists
   ansible.builtin.file:
     path: /etc/containerd
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Ensure /etc/containerd/conf.d exists (drop-in dir for the imports glob)
+  ansible.builtin.file:
+    path: /etc/containerd/conf.d
     state: directory
     owner: root
     group: root
@@ -25,23 +48,95 @@
   changed_when: false
   register: containerd_default_config
 
-- name: Render containerd config with the systemd cgroup driver enabled
+- name: Build config content with the systemd cgroup driver enabled
+  ansible.builtin.set_fact:
+    _containerd_config_content: "{{ containerd_default_config.stdout | regex_replace('SystemdCgroup = false', 'SystemdCgroup = true') }}"
+
+# --- nvidia runtime drop-in (GPU nodes only) --------------------------------
+- name: Check whether nvidia-ctk is installed (container toolkit present?)
+  ansible.builtin.command: which nvidia-ctk
+  changed_when: false
+  failed_when: false
+  register: nvidia_ctk_check
+
+- name: Decide whether to wire the nvidia runtime on this node
+  ansible.builtin.set_fact:
+    _gpu_runtime_wanted: "{{ (inventory_hostname in (groups['gpu_nodes'] | default([]))) and (nvidia_ctk_check.rc == 0) }}"
+
+# Make sure the main config loads the drop-in. containerd's own default already
+# emits the imports glob; prepend it only if a given build omits it, so the
+# rendered content stays deterministic (no double-imports on re-run).
+- name: Ensure config.toml imports the conf.d drop-in (GPU nodes)
+  ansible.builtin.set_fact:
+    _containerd_config_content: "imports = [\"/etc/containerd/conf.d/*.toml\"]\n{{ _containerd_config_content }}"
+  when:
+    - _gpu_runtime_wanted | bool
+    - "'/etc/containerd/conf.d/*.toml' not in _containerd_config_content"
+
+- name: Render containerd config (single owner of config.toml)
   ansible.builtin.copy:
-    content: "{{ containerd_default_config.stdout | regex_replace('SystemdCgroup = false', 'SystemdCgroup = true') }}"
-    dest: /etc/containerd/config.toml
+    content: "{{ _containerd_config_content }}"
+    dest: "{{ containerd_config_path | default('/etc/containerd/config.toml') }}"
     owner: root
     group: root
     mode: "0644"
     backup: true
   register: containerd_config_render
 
-- name: Restart containerd to apply the regenerated config
+- name: Snapshot the nvidia drop-in before configure (for change detection)
+  ansible.builtin.stat:
+    path: /etc/containerd/conf.d/99-nvidia.toml
+    checksum_algorithm: sha1
+  register: nvidia_dropin_before
+  when: _gpu_runtime_wanted | bool
+
+# --config points at a throwaway copy so nvidia-ctk can't reformat the real
+# config.toml; the nvidia runtime is still written to the absolute drop-in
+# path. No --set-as-default: the cluster selects it via the Flux RuntimeClass.
+- name: Stage a throwaway config for nvidia-ctk to read
+  ansible.builtin.copy:
+    content: "{{ _containerd_config_content }}"
+    dest: /tmp/containerd-config-nvidia-scratch.toml
+    mode: "0600"
+  changed_when: false
+  when: _gpu_runtime_wanted | bool
+
+- name: Register the nvidia runtime (writes the conf.d/99-nvidia.toml drop-in)
+  ansible.builtin.command: >-
+    nvidia-ctk runtime configure --runtime=containerd
+    --config=/tmp/containerd-config-nvidia-scratch.toml
+  changed_when: false
+  when: _gpu_runtime_wanted | bool
+
+- name: Remove the throwaway config
+  ansible.builtin.file:
+    path: /tmp/containerd-config-nvidia-scratch.toml
+    state: absent
+  changed_when: false
+  when: _gpu_runtime_wanted | bool
+
+- name: Snapshot the nvidia drop-in after configure
+  ansible.builtin.stat:
+    path: /etc/containerd/conf.d/99-nvidia.toml
+    checksum_algorithm: sha1
+  register: nvidia_dropin_after
+  when: _gpu_runtime_wanted | bool
+
+- name: Note whether the nvidia drop-in changed
+  ansible.builtin.set_fact:
+    _nvidia_dropin_changed: "{{ _gpu_runtime_wanted | bool and (nvidia_dropin_before.stat.checksum | default('')) != (nvidia_dropin_after.stat.checksum | default('')) }}"
+
+# Reboot supersedes restart: if a GPU reboot is already queued, skip the
+# standalone restart (the reboot restarts containerd with the new config).
+- name: Restart containerd to apply config / drop-in changes
   ansible.builtin.systemd:
     name: containerd
     state: restarted
     enabled: true
     daemon_reload: true
-  when: containerd_config_render is changed
+  when:
+    - containerd_config_render is changed or (_nvidia_dropin_changed | default(false) | bool)
+    - not (gpu_reboot_required | default(false))
 
 - name: Verify containerd is active
   ansible.builtin.command: systemctl is-active containerd

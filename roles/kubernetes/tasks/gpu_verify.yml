@@ -1,0 +1,43 @@
+---
+# Verification gate. Runs after any reboot so the NVIDIA module is loaded.
+# Fails the play if the driver doesn't respond or the nvidia runtime isn't
+# registered in containerd — these asserts are the contract the Flux
+# nvidia-device-plugin / dcgm-exporter rely on.
+
+- name: Run nvidia-smi (driver responds)
+  ansible.builtin.command: nvidia-smi
+  changed_when: false
+  register: nvidia_smi
+
+- name: Show nvidia-smi output
+  ansible.builtin.debug:
+    var: nvidia_smi.stdout_lines
+
+# nvidia-ctk writes the runtime to a drop-in (conf.d/99-nvidia.toml) that the
+# main config imports, so grep the *effective merged* config, not config.toml.
+# `config dump` also proves the drop-in is actually being loaded by containerd.
+- name: Assert the nvidia runtime is registered in the effective containerd config
+  ansible.builtin.shell: "containerd config dump | grep -q nvidia-container-runtime"
+  changed_when: false
+
+# Optional end-to-end proof: run nvidia-smi inside a CUDA container through the
+# nvidia runtime. Off by default (pulls an image); enable with
+# gpu_run_test_container=true.
+- name: Pull the CUDA test image
+  ansible.builtin.command: "ctr -n k8s.io images pull {{ gpu_test_image }}"
+  changed_when: false
+  when: gpu_run_test_container | default(false) | bool
+
+- name: Run nvidia-smi inside a test container via the nvidia runtime
+  ansible.builtin.command: >-
+    ctr -n k8s.io run --rm --runc-binary /usr/bin/nvidia-container-runtime
+    --env NVIDIA_VISIBLE_DEVICES=all
+    {{ gpu_test_image }} gpu-smoke-test nvidia-smi
+  changed_when: false
+  register: ctr_smi
+  when: gpu_run_test_container | default(false) | bool
+
+- name: Show test-container nvidia-smi output
+  ansible.builtin.debug:
+    var: ctr_smi.stdout_lines
+  when: gpu_run_test_container | default(false) | bool

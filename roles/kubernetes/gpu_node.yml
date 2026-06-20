@@ -1,0 +1,314 @@
+---
+# Bring a kubeadm worker with a freshly passed-through NVIDIA GPU to a working
+# NVIDIA runtime, so the Flux nvidia-device-plugin + dcgm-exporter can schedule
+# onto it. This playbook owns HOST state only — the cluster side (RuntimeClass,
+# device-plugin, dcgm-exporter) lives in the Flux repo and is merged afterward.
+#
+# Sequence: Proxmox passthrough (manual, Phase 1) -> this playbook -> merge the
+# Flux nvidia-gpu PR.
+#
+# Usage:
+#   ansible-playbook -i dev_hosts.yml roles/kubernetes/gpu_node.yml
+#
+# Optional variables (defaults in group_vars/gpu_nodes.yml):
+#   gpu_node_drain: true            — cordon/drain (Longhorn-aware) around the
+#                                     disruptive reboot/containerd restart
+#   nvidia_driver_branch: "550"     — DKMS driver branch (pinned + held)
+#   nvidia_container_toolkit_version — pin once confirmed, then it's held
+#   gpu_run_test_container: false   — also run nvidia-smi in a CUDA container
+#
+# Re-running is safe: the second run reports zero changes and no reboot.
+
+########################################################################
+# Play 1 — Ensure control-plane kubeconfig is current and HA
+########################################################################
+# Drain/uncordon/label below are delegated to kube_server[0]; make sure that
+# node has a working, VIP-pointed kubeconfig (kubeadm cert renewal can leave
+# ~/.kube/config stale). Mirrors the self-healing step in upgrade_os.yml.
+- name: Ensure control-plane kubeconfig is current and HA
+  hosts: kube_server
+  become: true
+  remote_user: debian
+  any_errors_fatal: true
+
+  tasks:
+    - name: Ensure .kube directory exists
+      file:
+        path: "{{ home_dir }}/.kube"
+        state: directory
+        owner: debian
+        group: debian
+        mode: "0700"
+
+    - name: Read cluster admin.conf
+      slurp:
+        src: /etc/kubernetes/admin.conf
+      register: admin_conf
+
+    - name: Render kubeconfig pointed at the control-plane VIP
+      copy:
+        content: "{{ admin_conf.content | b64decode | regex_replace('server: https?://.*', 'server: https://' ~ control_vip ~ ':' ~ haproxy_port) }}"
+        dest: "{{ home_dir }}/.kube/config"
+        owner: debian
+        group: debian
+        mode: "0600"
+
+########################################################################
+# Play 2 — GPU enablement (one node at a time)
+########################################################################
+- name: Enable NVIDIA GPU on worker nodes
+  hosts: gpu_nodes
+  serial: 1
+  become: true
+  remote_user: debian
+  any_errors_fatal: true
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    # Pre-flight FIRST, before any state change: bail out if there's no GPU.
+    - name: GPU pre-flight gate
+      include_tasks: tasks/gpu_preflight.yml
+
+    - name: Enable GPU on this node
+      block:
+        - name: Resolve Kubernetes node name for this host
+          shell: >
+            kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name} {.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+            | awk '$2 == "{{ ansible_default_ipv4.address | default(inventory_hostname) }}" { print $1 }'
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: k8s_node_name_result
+
+        - name: Fail if Kubernetes node name could not be resolved
+          fail:
+            msg: >-
+              Could not resolve Kubernetes node name for {{ inventory_hostname }}.
+              Check: kubectl get nodes -o wide
+          when: k8s_node_name_result.stdout | trim == ""
+
+        - name: Set k8s_node_name fact
+          set_fact:
+            k8s_node_name: "{{ k8s_node_name_result.stdout | trim }}"
+
+        # ---- Idempotency gate: is there anything to do on this node? --------
+        - name: Check whether nouveau is already blacklisted
+          stat:
+            path: /etc/modprobe.d/blacklist-nouveau.conf
+          register: pre_nouveau
+
+        - name: Check whether the NVIDIA driver already responds
+          command: nvidia-smi
+          changed_when: false
+          failed_when: false
+          register: pre_smi
+
+        - name: Check whether the container toolkit (nvidia-ctk) is installed
+          command: which nvidia-ctk
+          changed_when: false
+          failed_when: false
+          register: pre_ctk
+
+        # nvidia-ctk wires the runtime via a conf.d drop-in, so check the
+        # effective merged config (config dump), not config.toml itself.
+        - name: Check whether the nvidia runtime is active in containerd
+          shell: "containerd config dump 2>/dev/null | grep -q nvidia-container-runtime"
+          changed_when: false
+          failed_when: false
+          register: pre_runtime
+
+        # Will tasks/containerd_config.yml rewrite config.toml (-> restart)? If
+        # so, count it as work so we drain first and the restart is graceful,
+        # rather than bouncing pods on an otherwise up-to-date node. Compare via
+        # $() on both sides: it strips trailing newlines, so the one the copy
+        # module drops (ansible .stdout has none) isn't a false "drift". (On
+        # containerd 1.x, whose `config default` omits the conf.d imports glob
+        # that containerd_config.yml prepends for GPU nodes, this may over-report
+        # drift and drain once extra — safe, just not minimal. The cluster is 2.x.)
+        - name: Check whether containerd config.toml would change
+          shell: |
+            [ "$(containerd config default | sed 's/SystemdCgroup = false/SystemdCgroup = true/')" = "$(cat {{ containerd_config_path }} 2>/dev/null)" ]
+          args:
+            executable: /bin/bash
+          changed_when: false
+          failed_when: false
+          register: pre_containerd_drift
+
+        - name: Check if node is currently cordoned
+          shell: "kubectl get node {{ k8s_node_name }} -o jsonpath='{.spec.unschedulable}'"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: node_cordoned
+
+        - name: Determine whether this node needs GPU work
+          set_fact:
+            gpu_work_needed: "{{ (not pre_nouveau.stat.exists)
+                                  or (pre_smi.rc != 0)
+                                  or (pre_ctk.rc != 0)
+                                  or (pre_runtime.rc != 0)
+                                  or (pre_containerd_drift.rc != 0)
+                                  or (node_cordoned.stdout | default('') | trim == 'true') }}"
+
+        - name: Skip message
+          debug:
+            msg: "GPU already enabled and node schedulable — nothing to do on {{ k8s_node_name }}"
+          when: not gpu_work_needed | bool
+
+        # ---- Disruption handling: suspend Flux + drain before changes ------
+        - name: Suspend Flux kustomizations from the control node
+          include_tasks: tasks/flux_suspend.yml
+          when: gpu_work_needed | bool and gpu_node_drain | bool
+
+        - name: Drain node before disruptive GPU steps
+          command: "kubectl drain {{ k8s_node_name }} --ignore-daemonsets --delete-emptydir-data --disable-eviction --timeout=300s"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          register: drain_result
+          until: drain_result.rc == 0
+          retries: 3
+          delay: 30
+          when: gpu_work_needed | bool and gpu_node_drain | bool
+
+        # ---- Host configuration (each step is individually idempotent) -----
+        - name: Blacklist nouveau
+          include_tasks: tasks/gpu_nouveau.yml
+
+        - name: Install the NVIDIA DKMS driver
+          include_tasks: tasks/gpu_driver.yml
+
+        - name: Install the NVIDIA Container Toolkit
+          include_tasks: tasks/gpu_toolkit.yml
+
+        # Wires the nvidia runtime into config.toml (single owner). Skips its
+        # own containerd restart when a reboot is already queued.
+        - name: Configure containerd (regenerate config + nvidia runtime)
+          include_tasks: tasks/containerd_config.yml
+
+        # ---- Single reboot for nouveau/driver changes ---------------------
+        - name: Reboot to load the NVIDIA driver and apply the nouveau blacklist
+          reboot:
+            msg: "GPU driver/nouveau reboot"
+            reboot_timeout: "{{ reboot_timeout | default(600) }}"
+          when: gpu_reboot_required | default(false) | bool
+
+        - name: Wait for kubelet to be ready
+          command: systemctl is-active kubelet
+          changed_when: false
+          register: kubelet_status
+          until: kubelet_status.rc == 0
+          retries: 30
+          delay: 10
+          when: gpu_work_needed | bool
+
+        - name: Wait for API server to be ready
+          command: kubectl get --raw /readyz
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: api_ready
+          until: api_ready.rc == 0
+          retries: 30
+          delay: 10
+          when: gpu_work_needed | bool
+
+        # ---- Verification gate (after reboot) -----------------------------
+        - name: Verify nvidia-smi and the containerd nvidia runtime
+          include_tasks: tasks/gpu_verify.yml
+
+        # ---- Node enablement ----------------------------------------------
+        - name: Label the node for the GPU device-plugin nodeSelector
+          command: "kubectl label node {{ k8s_node_name }} {{ gpu_node_label }} --overwrite"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          register: label_result
+          changed_when: "'not labeled' not in label_result.stdout"
+
+        - name: Uncordon node
+          command: "kubectl uncordon {{ k8s_node_name }}"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          register: uncordon_result
+          until: uncordon_result.rc == 0
+          retries: 6
+          delay: 10
+          when: gpu_work_needed | bool and gpu_node_drain | bool
+
+        - name: Wait for node to become Ready
+          command: "kubectl wait --for=condition=Ready node/{{ k8s_node_name }} --timeout=300s"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          when: gpu_work_needed | bool
+
+        # Gate on Longhorn volume health before releasing the node (drain may
+        # have made replicas degraded) — see tasks/longhorn_wait.yml.
+        - name: Gate on Longhorn volume health
+          include_tasks: tasks/longhorn_wait.yml
+          when: gpu_work_needed | bool and gpu_node_drain | bool
+
+      rescue:
+        - name: Attempt to uncordon node after failure
+          command: "kubectl uncordon {{ k8s_node_name | default(inventory_hostname) }}"
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          ignore_errors: true
+
+        - name: Resume Flux kustomizations after failure (best-effort)
+          include_tasks: tasks/flux_resume.yml
+          vars:
+            flux_besteffort: true
+
+        - name: Fail with GPU enablement error
+          fail:
+            msg: >-
+              GPU enablement failed on {{ inventory_hostname }}
+              (k8s node: {{ k8s_node_name | default('unknown') }}).
+              Best-effort uncordon and Flux resume attempted.
+              Verify with: kubectl get nodes && nvidia-smi
+              Investigate and re-run.
+
+########################################################################
+# Play 3 — Post-flight + resume Flux
+########################################################################
+- name: GPU enablement post-flight
+  hosts: kube_server[0]
+  become: false
+  remote_user: debian
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+
+  tasks:
+    - name: Post-flight
+      block:
+        - name: Show GPU nodes and their labels
+          command: "kubectl get nodes -L gpu -o wide"
+          changed_when: false
+          register: gpu_node_status
+
+        - name: Display GPU node status
+          debug:
+            var: gpu_node_status.stdout_lines
+
+        - name: Resume Flux kustomizations from the control node
+          include_tasks: tasks/flux_resume.yml
+
+        - name: GPU enablement complete
+          debug:
+            msg: >-
+              GPU host enablement complete. Now merge the Flux nvidia-gpu PR so
+              the device-plugin schedules and nvidia.com/gpu appears on the node.
+
+      rescue:
+        - name: Resume Flux kustomizations after post-flight failure (best-effort)
+          include_tasks: tasks/flux_resume.yml
+          vars:
+            flux_besteffort: true
+
+        - name: Fail with post-flight error
+          fail:
+            msg: >-
+              Post-flight checks failed. Host GPU enablement itself completed but
+              verification encountered an error. Flux resume attempted.
+              Run manually: kubectl get nodes -L gpu && flux resume kustomization --all
