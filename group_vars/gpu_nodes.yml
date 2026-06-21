@@ -17,9 +17,9 @@ nvidia_driver_branch: "550"
 # the branch — making fresh GPU-node installs reproducible. Empty = newest.
 nvidia_driver_version: ""
 
-# NVIDIA CUDA apt repo distro slug. The cluster runs Debian 11 (Bullseye).
-# If/when the GPU node is upgraded to Bookworm, change this to "debian12".
-nvidia_cuda_repo_distro: "debian11"
+# NVIDIA CUDA apt repo distro slug. The cluster runs Debian 12 (Bookworm)
+# since the 2026-06 bullseye->bookworm upgrade.
+nvidia_cuda_repo_distro: "debian12"
 
 # Pin a specific nvidia-container-toolkit version once you've confirmed one
 # (e.g. "1.16.2-1"); empty installs the current latest, which is then held.
