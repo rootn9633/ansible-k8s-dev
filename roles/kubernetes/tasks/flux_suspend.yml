@@ -9,6 +9,7 @@
   delegate_to: localhost
   become: false
   changed_when: false
+  check_mode: false
   register: flux_cli_check
   ignore_errors: true
 

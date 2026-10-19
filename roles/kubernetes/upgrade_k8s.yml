@@ -41,6 +41,7 @@
       command: kubectl get nodes -o jsonpath='{.items[*].status.nodeInfo.kubeletVersion}'
       become: false
       changed_when: false
+      check_mode: false
       register: all_node_versions
 
     - name: Derive previous minor version
@@ -85,6 +86,7 @@
       shell: kubectl get nodes --no-headers | grep -v ' Ready ' || true
       become: false
       changed_when: false
+      check_mode: false
       register: not_ready_nodes
 
     - name: Fail if any nodes are not Ready
@@ -97,6 +99,7 @@
     - name: Check etcdctl is available
       command: which etcdctl
       changed_when: false
+      check_mode: false
       register: etcdctl_check
       ignore_errors: true
 
@@ -149,6 +152,7 @@
       command: kubectl get --raw /metrics
       become: false
       changed_when: false
+      check_mode: false
       register: api_metrics
 
     - name: Check for deprecated API usage
