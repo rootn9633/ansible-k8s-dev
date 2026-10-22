@@ -49,16 +49,23 @@
 # Filter to genuinely-installed packages (Status-Abbrev 2nd char 'i'): the glob
 # also matches virtual packages/provides (status 'un'), which can't be held and
 # would make dpkg_selections report "changed" on every run.
-# Hold the WHOLE nvidia-* userspace, not just the driver/kernel/lib subset.
+# Hold the WHOLE NVIDIA userspace, not just the driver/kernel/lib subset.
 # A partial hold is what split the stack during the 2026-06 bookworm upgrade:
 # the held driver/libs stayed at 560 while unheld siblings (nvidia-smi,
 # nvidia-settings, nvidia-modprobe, …) drifted to the repo's newer 610,
-# breaking /usr/bin/nvidia-smi. 'nvidia-*' + 'libxnvctrl*' close that gap.
+# breaking /usr/bin/nvidia-smi. Some driver packages don't match the name
+# globs (libcuda1, libglx-nvidia0, …), so also select everything carrying the
+# installed driver's version.
 - name: Find installed NVIDIA driver / CUDA packages
-  ansible.builtin.shell: >-
-    dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n'
-    'cuda-drivers*' 'nvidia-*' 'libnvidia-*' 'libxnvctrl*' 2>/dev/null
-    | awk '$1 ~ /^.i/ {print $2}' || true
+  ansible.builtin.shell: |
+    drv=$(dpkg-query -W -f='${Version}' nvidia-driver 2>/dev/null | cut -d- -f1)
+    {
+      dpkg-query -W -f='${db:Status-Abbrev} ${Package}\n' \
+        'cuda-drivers*' 'nvidia-*' 'libnvidia-*' 'libxnvctrl*' 2>/dev/null \
+        | awk '$1 ~ /^.i/ {print $2}'
+      [ -n "$drv" ] && dpkg-query -W -f='${db:Status-Abbrev} ${Package} ${Version}\n' \
+        | awk -v v="$drv" '$1 ~ /^.i/ && index($3, v "-") == 1 {print $2}'
+    } | sort -u
   changed_when: false
   register: nvidia_driver_pkgs
 
