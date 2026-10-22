@@ -115,6 +115,11 @@
           become: false
           changed_when: false
           register: k8s_node_name_result
+          # Empty output also covers a transient kubectl error (e.g. 403 from
+          # a just-restarted apiserver): the awk pipe hides kubectl's rc.
+          until: k8s_node_name_result.stdout | trim != ""
+          retries: 12
+          delay: 10
 
         - name: Fail if Kubernetes node name could not be resolved
           fail:
@@ -163,6 +168,9 @@
           become: false
           changed_when: false
           register: node_cordoned
+          until: node_cordoned.rc == 0
+          retries: 12
+          delay: 10
 
         - name: Determine if node needs work
           set_fact:
@@ -257,6 +265,27 @@
           changed_when: false
           when: node_needs_work | bool
 
+        # A rebooted CP's apiserver starts cold. HAProxy routes to it as soon
+        # as its port opens, and until its RBAC caches sync it answers 403 —
+        # which would break the next node's kubectl calls. Wait for it to be
+        # Ready and up for 60s before moving on.
+        - name: Wait for this node's kube-apiserver to settle
+          command: >-
+            kubectl -n kube-system get pod kube-apiserver-{{ k8s_node_name }}
+            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status} {.status.containerStatuses[0].state.running.startedAt}'
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: apiserver_pod
+          until: >-
+            apiserver_pod.rc == 0
+            and (apiserver_pod.stdout.split() | length) == 2
+            and apiserver_pod.stdout.split()[0] == 'True'
+            and (now(utc=true) - (apiserver_pod.stdout.split()[1] | to_datetime('%Y-%m-%dT%H:%M:%SZ'))).total_seconds() > 60
+          retries: 30
+          delay: 10
+          when: node_needs_work | bool
+
       rescue:
         - name: Pick a healthy CP for rescue commands
           set_fact:
@@ -310,6 +339,11 @@
           become: false
           changed_when: false
           register: k8s_node_name_result
+          # Empty output also covers a transient kubectl error (e.g. 403 from
+          # a just-restarted apiserver): the awk pipe hides kubectl's rc.
+          until: k8s_node_name_result.stdout | trim != ""
+          retries: 12
+          delay: 10
 
         - name: Fail if Kubernetes node name could not be resolved
           fail:
@@ -358,6 +392,9 @@
           become: false
           changed_when: false
           register: node_cordoned
+          until: node_cordoned.rc == 0
+          retries: 12
+          delay: 10
 
         - name: Determine if node needs work
           set_fact:
