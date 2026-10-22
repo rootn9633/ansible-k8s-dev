@@ -1,0 +1,135 @@
+---
+# Rolling upgrade of cri-tools (crictl) and kubernetes-cni to the newest
+# version in each node's configured pkgs.k8s.io channel, one node at a time.
+#
+# upgrade_k8s.yml does this as part of every Kubernetes upgrade (via the
+# shared tasks/k8s_tools_packages.yml). Run this standalone to catch nodes up
+# without a Kubernetes version change — e.g. when the packages lagged behind
+# the cluster's minor version.
+#
+# No drain and no restarts (see tasks/k8s_tools_packages.yml). After each
+# node, a smoke-test pod is started ON that node to prove new pod sandboxes
+# still come up with networking (exercising the upgraded loopback plugin)
+# before moving to the next node.
+#
+# Idempotent: nodes already on the latest versions report no changes, but
+# the smoke test still runs.
+#
+# Usage:
+#   ansible-playbook -i dev_hosts.yml roles/kubernetes/upgrade_k8s_tools.yml
+#   # canary a single node first:
+#   ansible-playbook -i dev_hosts.yml roles/kubernetes/upgrade_k8s_tools.yml --limit 192.168.3.41
+
+- name: Upgrade cri-tools and kubernetes-cni
+  hosts: kube_server:kube_agents
+  serial: 1
+  become: true
+  remote_user: debian
+  any_errors_fatal: true
+  environment:
+    KUBECONFIG: "{{ home_dir }}/.kube/config"
+  vars:
+    k8s_tool_packages:
+      - cri-tools
+      - kubernetes-cni
+    smoke_pod: "k8s-tools-smoke-{{ inventory_hostname | replace('.', '-') }}"
+
+  tasks:
+    - name: Resolve Kubernetes node name for this host
+      shell: >
+        kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name} {.status.addresses[?(@.type=="InternalIP")].address}{"\n"}{end}'
+        | awk '$2 == "{{ ansible_default_ipv4.address | default(inventory_hostname) }}" { print $1 }'
+      delegate_to: "{{ groups['kube_server'][0] }}"
+      become: false
+      changed_when: false
+      register: k8s_node_name_result
+      # Empty output also covers a transient kubectl error: the awk pipe
+      # hides kubectl's rc.
+      until: k8s_node_name_result.stdout | trim != ""
+      retries: 12
+      delay: 10
+
+    - name: Set k8s_node_name fact
+      set_fact:
+        k8s_node_name: "{{ k8s_node_name_result.stdout | trim }}"
+
+    - name: Upgrade cri-tools and kubernetes-cni
+      include_tasks: tasks/k8s_tools_packages.yml
+
+    - name: Verify crictl can reach containerd
+      shell: crictl --version && crictl --runtime-endpoint unix:///run/containerd/containerd.sock version
+      changed_when: false
+      register: crictl_version
+
+    - name: Show installed versions
+      debug:
+        msg: >-
+          {{ k8s_node_name }}:
+          {{ (k8s_tools_upgrade.stdout_lines | default([]) | select('search', '^Setting up') | list) or ['already up to date'] }}
+          | {{ crictl_version.stdout_lines | select('search', '^crictl version|RuntimeVersion') | list }}
+
+    # Use containerd's own sandbox (pause) image: already cached on every
+    # node, so the smoke test needs no registry access.
+    - name: Read containerd sandbox image
+      shell: containerd config dump | awk -F"'" '/^[[:space:]]*sandbox[[:space:]]*=/ { print $2; exit }'
+      changed_when: false
+      register: sandbox_image
+
+    - name: Fail if the sandbox image could not be determined
+      fail:
+        msg: "Could not read the sandbox image from `containerd config dump` on {{ inventory_hostname }}."
+      when: sandbox_image.stdout | trim == ""
+
+    - name: Smoke test new pod sandbox on this node
+      block:
+        - name: Start smoke-test pod pinned to this node
+          shell: |
+            kubectl delete pod -n default {{ smoke_pod }} --ignore-not-found --wait=true
+            kubectl apply -f - <<'EOF'
+            apiVersion: v1
+            kind: Pod
+            metadata:
+              name: {{ smoke_pod }}
+              namespace: default
+              labels:
+                app: k8s-tools-smoke
+            spec:
+              nodeName: {{ k8s_node_name }}
+              restartPolicy: Never
+              terminationGracePeriodSeconds: 0
+              tolerations:
+                - operator: Exists
+              containers:
+                - name: pause
+                  image: {{ sandbox_image.stdout | trim }}
+                  imagePullPolicy: IfNotPresent
+            EOF
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+
+        - name: Wait for smoke-test pod to be Ready with a pod IP
+          command: >-
+            kubectl get pod -n default {{ smoke_pod }}
+            -o jsonpath='{.status.conditions[?(@.type=="Ready")].status} {.status.podIP}'
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          register: smoke_status
+          until: >-
+            smoke_status.rc == 0
+            and (smoke_status.stdout.split() | length) == 2
+            and smoke_status.stdout.split()[0] == 'True'
+          retries: 18
+          delay: 5
+
+        - name: Report smoke test result
+          debug:
+            msg: "Pod sandbox OK on {{ k8s_node_name }} (pod IP {{ smoke_status.stdout.split()[1] }})"
+
+      always:
+        - name: Remove smoke-test pod
+          command: kubectl delete pod -n default {{ smoke_pod }} --ignore-not-found --wait=false
+          delegate_to: "{{ groups['kube_server'][0] }}"
+          become: false
+          changed_when: false
+          failed_when: false

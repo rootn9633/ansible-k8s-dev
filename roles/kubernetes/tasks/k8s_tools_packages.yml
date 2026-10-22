@@ -1,0 +1,35 @@
+---
+# Upgrade cri-tools (crictl) and kubernetes-cni to the newest version in the
+# node's configured pkgs.k8s.io channel, then re-hold them so upgrade_os.yml
+# never moves them. cri-tools versions track the Kubernetes minor, and the
+# new minor only becomes available once the channel is switched — which is
+# why upgrade_k8s.yml (which switches the channel) owns these packages.
+#
+# Safe to run on a live node: no drain, no containerd/kubelet restart.
+# crictl is a CLI only. kubernetes-cni ships the standard plugins in
+# /opt/cni/bin; pod networking itself is cilium-cni, but containerd still
+# calls the `loopback` plugin for every new pod sandbox. dpkg replaces those
+# binaries atomically, so running and starting pods are unaffected.
+#
+# Idempotent: reports changed only when a package actually moved.
+- name: Unhold cri-tools and kubernetes-cni
+  dpkg_selections:
+    name: "{{ item }}"
+    selection: install
+  loop: "{{ k8s_tool_packages }}"
+  changed_when: false
+
+- name: Upgrade cri-tools and kubernetes-cni to latest in the configured channel
+  apt:
+    name: "{{ k8s_tool_packages }}"
+    state: latest
+    update_cache: yes
+    force_apt_get: yes
+  register: k8s_tools_upgrade
+
+- name: Re-hold cri-tools and kubernetes-cni
+  dpkg_selections:
+    name: "{{ item }}"
+    selection: hold
+  loop: "{{ k8s_tool_packages }}"
+  changed_when: false

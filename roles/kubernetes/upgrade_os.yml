@@ -139,9 +139,11 @@
 
         # The container runtime is deliberately excluded from OS patching so a
         # routine upgrade never does a surprise major containerd jump. The
-        # runtime is upgraded via the dedicated upgrade_containerd.yml. Holding
-        # here (before the simulate) also keeps these out of the update count.
-        - name: Hold container runtime packages (managed by upgrade_containerd.yml)
+        # runtime is upgraded via the dedicated upgrade_containerd.yml, and
+        # cri-tools/kubernetes-cni by upgrade_k8s.yml (or upgrade_k8s_tools.yml).
+        # Holding here (before the simulate) also keeps these out of the
+        # update count.
+        - name: Hold container runtime packages (managed by upgrade_containerd.yml / upgrade_k8s.yml)
           dpkg_selections:
             name: "{{ item }}"
             selection: hold
@@ -363,9 +365,11 @@
 
         # The container runtime is deliberately excluded from OS patching so a
         # routine upgrade never does a surprise major containerd jump. The
-        # runtime is upgraded via the dedicated upgrade_containerd.yml. Holding
-        # here (before the simulate) also keeps these out of the update count.
-        - name: Hold container runtime packages (managed by upgrade_containerd.yml)
+        # runtime is upgraded via the dedicated upgrade_containerd.yml, and
+        # cri-tools/kubernetes-cni by upgrade_k8s.yml (or upgrade_k8s_tools.yml).
+        # Holding here (before the simulate) also keeps these out of the
+        # update count.
+        - name: Hold container runtime packages (managed by upgrade_containerd.yml / upgrade_k8s.yml)
           dpkg_selections:
             name: "{{ item }}"
             selection: hold

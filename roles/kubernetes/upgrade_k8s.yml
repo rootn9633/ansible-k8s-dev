@@ -350,6 +350,16 @@
             - kubectl
           when: node_needs_upgrade | bool
 
+        # The repo now points at the target channel, so this brings crictl
+        # up to the target minor (and kubernetes-cni to its latest).
+        - name: Upgrade cri-tools and kubernetes-cni
+          include_tasks: tasks/k8s_tools_packages.yml
+          vars:
+            k8s_tool_packages:
+              - cri-tools
+              - kubernetes-cni
+          when: node_needs_upgrade | bool
+
         # The --pod-infra-container-image kubelet flag was removed in v1.35;
         # a 1.35+ kubelet refuses to start if it is still present in
         # kubeadm-flags.env. Older kubeadm wrote it at bootstrap and never
@@ -606,6 +616,16 @@
           loop:
             - kubelet
             - kubectl
+          when: node_needs_upgrade | bool
+
+        # The repo now points at the target channel, so this brings crictl
+        # up to the target minor (and kubernetes-cni to its latest).
+        - name: Upgrade cri-tools and kubernetes-cni
+          include_tasks: tasks/k8s_tools_packages.yml
+          vars:
+            k8s_tool_packages:
+              - cri-tools
+              - kubernetes-cni
           when: node_needs_upgrade | bool
 
         # The --pod-infra-container-image kubelet flag was removed in v1.35;

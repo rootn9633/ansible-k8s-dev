@@ -103,10 +103,10 @@
   tasks:
     - name: Upgrade control-plane containerd
       vars:
+        # cri-tools / kubernetes-cni track the Kubernetes minor and are
+        # upgraded by upgrade_k8s.yml (tasks/k8s_tools_packages.yml).
         _runtime_packages:
           - containerd.io
-          - cri-tools
-          - kubernetes-cni
       block:
         - name: Resolve Kubernetes node name for this host
           shell: >
@@ -170,7 +170,7 @@
           loop: "{{ _runtime_packages }}"
           when: node_needs_work | bool
 
-        - name: Upgrade containerd and runtime tooling to latest
+        - name: Upgrade containerd to latest
           apt:
             name: "{{ _runtime_packages }}"
             state: latest
@@ -258,10 +258,10 @@
   tasks:
     - name: Upgrade worker containerd
       vars:
+        # cri-tools / kubernetes-cni track the Kubernetes minor and are
+        # upgraded by upgrade_k8s.yml (tasks/k8s_tools_packages.yml).
         _runtime_packages:
           - containerd.io
-          - cri-tools
-          - kubernetes-cni
       block:
         - name: Resolve Kubernetes node name for this host
           shell: >
@@ -325,7 +325,7 @@
           loop: "{{ _runtime_packages }}"
           when: node_needs_work | bool
 
-        - name: Upgrade containerd and runtime tooling to latest
+        - name: Upgrade containerd to latest
           apt:
             name: "{{ _runtime_packages }}"
             state: latest
